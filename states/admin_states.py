@@ -31,6 +31,20 @@ class AdminStates(StatesGroup):
     broadcast_text = State()
     clone_pending = State()
     set_help_text = State()
+    cfg_ref_bonus = State()
+    cfg_checkin_bonus = State()
+    cfg_forcejoin = State()
+    cfg_backup_time = State()
+    cfg_report_time = State()
+    coupon_code = State()
+    coupon_percent = State()
+    coupon_max = State()
+    faq_question = State()
+    faq_answer = State()
+    ticket_reply = State()
+    schedule_text = State()
+    schedule_time = State()
+    set_category = State()
 
 
 class PaymentStates(StatesGroup):
@@ -39,3 +53,6 @@ class PaymentStates(StatesGroup):
 
 class UserStates(StatesGroup):
     bselect = State()
+    coupon_code = State()
+    rate_text = State()
+    support_text = State()

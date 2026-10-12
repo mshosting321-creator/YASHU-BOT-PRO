@@ -1,6 +1,6 @@
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psutil
 
@@ -97,7 +97,7 @@ async def stats_text() -> str:
     wallets = await sum_balances()
     bot_uptime = (datetime.now(timezone.utc) - _STARTED_AT).total_seconds()
 
-    return (
+    text = (
         "📊 <b>Bot Stats</b>\n"
         "──────────────────────\n"
         f"👥 Users: <b>{users}</b> (banned: {banned})\n"
@@ -113,3 +113,42 @@ async def stats_text() -> str:
         f"⏱ Bot uptime: {uptime_text(bot_uptime)}\n"
         f"🗄 Database: <b>{backend_name()}</b>"
     )
+    graph = await _graph_text(requests)
+    if graph:
+        text += "\n" + graph
+    return text
+
+
+async def _graph_text(requests: list[dict]) -> str:
+    from utils import features
+
+    if not await features.is_on("graph"):
+        return ""
+    counts: dict[str, int] = {}
+    labels: list[str] = []
+    for offset in range(6, -1, -1):
+        day = (datetime.now(timezone.utc) - timedelta(days=offset)).date()
+        labels.append(day.strftime("%d %a"))
+        counts[day.isoformat()] = 0
+    for request in requests:
+        if str(request.get("status")) != "approved":
+            continue
+        created = request.get("created_at")
+        if isinstance(created, str):
+            try:
+                created = datetime.fromisoformat(created)
+            except ValueError:
+                created = None
+        if isinstance(created, datetime):
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            key = created.date().isoformat()
+            if key in counts:
+                counts[key] += 1
+    peak = max(counts.values()) if counts else 0
+    lines = ["📈 <b>Last 7 days (orders)</b>"]
+    for label, key in zip(labels, counts.keys()):
+        value = counts[key]
+        bar = "█" * min(20, round(value / peak * 20)) if peak else ""
+        lines.append(f"{label}: {value:>3} {bar}")
+    return "\n".join(lines)

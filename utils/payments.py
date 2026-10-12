@@ -76,6 +76,8 @@ async def create_payment_request(
     user_full_name: str | None,
     stuffs: list[dict],
     method: dict,
+    amount_override: float | None = None,
+    coupon: str | None = None,
 ) -> dict:
     stuff_ids = (
         ",".join(str(s["_id"]) for s in stuffs) if stuffs else None
@@ -84,6 +86,8 @@ async def create_payment_request(
         " + ".join(str(s.get("name") or "?") for s in stuffs) if stuffs else None
     )
     amount = sum(float(s.get("price", 0) or 0) for s in stuffs)
+    if amount_override is not None:
+        amount = float(amount_override)
     doc = {
         "user_tg_id": user_tg_id,
         "user_username": user_username,
@@ -93,6 +97,7 @@ async def create_payment_request(
         "method_id": str(method["_id"]) if method.get("_id") else None,
         "method_name": method.get("name"),
         "amount": amount,
+        "coupon": coupon,
         "status": "pending",
         "screenshot_file_id": None,
         "log_chat_id": None,
@@ -124,7 +129,15 @@ async def save_request_log_ids(request_id, chat_id: int, message_id: int) -> Non
 
 async def set_request_status(request_id, status: str) -> dict | None:
     await update_request(request_id, {"status": status})
-    return await get_request(request_id)
+    doc = await get_request(request_id)
+    if doc and str(status) == "approved":
+        try:
+            from utils import features
+
+            await features.credit_referral(doc)
+        except Exception:
+            logger.exception("Referral credit failed")
+    return doc
 
 
 async def get_log_chat_id() -> int | None:

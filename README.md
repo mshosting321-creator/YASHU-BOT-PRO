@@ -25,6 +25,40 @@ starts with `mongodb+srv`.
 - **Stats / VPS panel** — users, revenue, payment requests, plus live CPU/RAM/disk/uptime.
 - **Log group** — payment screenshots and transaction notices go to a group/channel you choose.
 
+### Togglable features (admin panel → Features)
+
+Every feature below has its own **ON/OFF button** in the panel's *Features* page, so you
+can switch them on or off without touching the code:
+
+- **Discount coupons** — create codes (`SAVE10` …) with percent off and max uses; buyers
+  apply the code at checkout (balance, manual and Stars payments all honour it).
+- **Referral rewards** — share `/start ref_<id>` links; the inviter gets a bonus (configurable)
+  automatically on the referred user's first approved purchase.
+- **Force join** — buyers must join your channel (`@username` or chat id) before paying.
+- **Daily check-in** — users claim a small bonus once per day (bonus configurable).
+- **Wishlist** — users save stuffs for later with a Wishlist + button on the stuff page.
+- **Purchase history** — users see their approved orders from the menu.
+- **Reviews** — users rate stuffs 1–5 stars with text; you approve them in the panel and
+  approved reviews show on the stuff page.
+- **Categories** — tag stuffs with a category (per-stuff *Category* button); the catalog
+  groups and prefixes them when the feature is on.
+- **Welcome back** — returning users get a list of stuffs added since their last `/start`.
+- **FAQ auto-reply** — unknown texts are matched against your question/answer pairs.
+- **Auto backup** — daily database backup (SQLite file / JSON export for MongoDB) posted
+  to the log group at the configured time.
+- **Daily report** — orders, revenue and user counts posted to the log group daily.
+- **Scheduled broadcasts** — queue a message for a specific date/time (server time).
+- **Maintenance mode** — non-admins only see a maintenance notice (default OFF).
+- **Resume position** — paid viewers jump back to the lesson they stopped at.
+- **Leaderboard** — top buyers by revenue, shown from the Features page.
+- **Support inbox** — users open tickets from the menu; reply/close them from the panel.
+- **Audit log** — important admin actions (creates, deletes, approvals, toggles) are logged.
+- **Stats graph** — 7-day order bars added to the Stats page.
+- **CSV export** — download the user list as a CSV file.
+
+Amount settings (referral bonus, check-in bonus, force-join channel, backup/report times)
+are edited from buttons on the same Features page.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -264,7 +298,7 @@ added inside the panel). Everyone else gets no response from `/admin`.
 
 - **Add stuff** — *Upload from ZIP* or *Direct video forwarding* (send videos/photos one by one).
 - **Stuffs** — open a stuff: add videos, demo list (tap to toggle demo/paid), rename, price,
-  showcase image, proofs, preview, delete, **Receive direct** (all media sent into the chat)
+  showcase image, proofs, **category**, preview, delete, **Receive direct** (all media sent into the chat)
   and **Download ZIP** (one archive with `info.txt`, videos, demo files, cover and proofs).
 - **Start message** — set text / photo / video, preview, clear media.
 - **Help text** — edit the text users see when they press the **Help** button (HTML supported).
@@ -275,9 +309,21 @@ added inside the panel). Everyone else gets no response from `/admin`.
 - **Log group** — forward a message from your group/channel (bot must be admin there).
 - **Users** — user manager: card with ban/unban and add/remove balance.
 - **Broadcast** — send HTML text to all users with preview and confirm.
-- **Stats** — users, stuffs, methods, requests, revenue, wallet balances, uptime.
+- **Stats** — users, stuffs, methods, requests, revenue, wallet balances, uptime
+  (plus a 7-day order graph when the graph feature is ON).
 - **VPS** — CPU, RAM, disk, process usage, bot/system uptime, active database backend.
 - **Clone bots** — list every clone with running/stopped status; start, stop or remove them.
+- **Features** — 20 ON/OFF toggles (coupons, referral, force-join, check-in, wishlist,
+  history, reviews, categories, welcome back, FAQ, auto backup, daily report, scheduler,
+  maintenance, resume, leaderboard, support, audit, graph, CSV) plus the buttons for
+  referral bonus, check-in bonus, force-join channel, backup time, report time,
+  Leaderboard, Audit log and CSV export.
+- **Coupons** — add a coupon (code, percent, max uses), toggle it on/off, delete it.
+- **Reviews** — approve or delete user reviews.
+- **Support** — open tickets: view, reply to the user, close.
+- **Schedule** — pending scheduled broadcasts: add or delete.
+- **FAQ** — question/answer pairs for the auto-reply feature: add or delete.
+- **Audit log** — the recent admin activity trail.
 
 Payment screenshots arrive in the log group with **Approve & unlock** / **Reject** buttons;
 approving delivers the media to the buyer immediately.

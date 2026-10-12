@@ -39,7 +39,13 @@ async def connect_mongo() -> None:
 
 async def _create_indexes() -> None:
     await users().create_index([("tg_id", ASCENDING)], unique=True)
-    await stuffs().create_index([("name", ASCENDING)], unique=True)
+    try:
+        await stuffs().drop_index("name_1")
+    except Exception:
+        pass
+    await stuffs().create_index(
+        [("bot", ASCENDING), ("name", ASCENDING)], unique=True
+    )
     await settings().create_index([("key", ASCENDING)], unique=True)
     await admins().create_index([("tg_id", ASCENDING)], unique=True)
     await payment_requests().create_index([("user_tg_id", ASCENDING)])

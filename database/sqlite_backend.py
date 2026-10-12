@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiosqlite
 
@@ -88,6 +88,8 @@ async def _ensure_stuffs_columns() -> None:
         "ALTER TABLE stuffs ADD COLUMN showcase TEXT",
         "ALTER TABLE stuffs ADD COLUMN proofs TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE stuffs ADD COLUMN bot TEXT NOT NULL DEFAULT 'main'",
+        "ALTER TABLE stuffs ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE stuffs ADD COLUMN created_at TEXT",
     ):
         try:
             await _db.execute(_migration)
@@ -112,12 +114,16 @@ async def _relax_stuffs_name_unique() -> None:
         "lessons TEXT NOT NULL DEFAULT '[]', "
         "showcase TEXT, "
         "proofs TEXT NOT NULL DEFAULT '[]', "
-        "bot TEXT NOT NULL DEFAULT 'main')"
+        "bot TEXT NOT NULL DEFAULT 'main', "
+        "category TEXT NOT NULL DEFAULT '', "
+        "created_at TEXT)"
     )
     await _db.execute(
         "INSERT INTO stuffs_tmp "
-        "(id, name, description, price, lessons, showcase, proofs, bot) "
-        "SELECT id, name, description, price, lessons, showcase, proofs, bot "
+        "(id, name, description, price, lessons, showcase, proofs, bot, "
+        "category, created_at) "
+        "SELECT id, name, description, price, lessons, showcase, proofs, bot, "
+        "category, created_at "
         "FROM stuffs"
     )
     await _db.execute("DROP TABLE stuffs")
@@ -290,6 +296,8 @@ def _stuff_row(row) -> dict:
         "showcase": row["showcase"] if "showcase" in keys else None,
         "proofs": _loads_list(row["proofs"]) if "proofs" in keys else [],
         "bot": row["bot"] if "bot" in keys else "main",
+        "category": row["category"] if "category" in keys else "",
+        "created_at": row["created_at"] if "created_at" in keys else None,
     }
 
 
@@ -347,12 +355,15 @@ async def create_stuff(
     showcase: str | None = None,
     proofs: list | None = None,
     bot: str = "main",
+    category: str = "",
 ) -> dict:
+    created_at = datetime.now(timezone.utc).isoformat()
     try:
         cursor = await _conn().execute(
             "INSERT INTO stuffs "
-            "(name, description, price, lessons, showcase, proofs, bot) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(name, description, price, lessons, showcase, proofs, bot, "
+            "category, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 description,
@@ -361,6 +372,8 @@ async def create_stuff(
                 showcase,
                 json.dumps(proofs or [], ensure_ascii=False),
                 bot,
+                category or "",
+                created_at,
             ),
         )
         await _conn().commit()
@@ -374,6 +387,8 @@ async def create_stuff(
         "lessons": lessons,
         "showcase": showcase,
         "proofs": proofs or [],
+        "category": category or "",
+        "created_at": created_at,
     }
 
 
@@ -404,6 +419,13 @@ async def rename_stuff(stuff_id, name: str) -> None:
 
 async def set_stuff_price(stuff_id, price: float) -> None:
     await _conn().execute("UPDATE stuffs SET price = ? WHERE id = ?", (price, int(stuff_id)))
+    await _conn().commit()
+
+
+async def set_stuff_category(stuff_id, category: str) -> None:
+    await _conn().execute(
+        "UPDATE stuffs SET category = ? WHERE id = ?", (category or "", int(stuff_id))
+    )
     await _conn().commit()
 
 

@@ -1,5 +1,6 @@
 import html
 import logging
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, F, Router
@@ -14,13 +15,24 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
-from database.store import deduct_balance, get_stuff, list_stuffs
+from database.store import (
+    add_balance,
+    deduct_balance,
+    get_setting,
+    get_stuff,
+    list_stuffs,
+    set_setting,
+)
 from keyboards.inline import (
     after_payment_kb,
     bdirect_kb,
     catalog_kb,
+    checkin_kb,
+    coupon_entry_kb,
     demo_list_kb,
     demo_view_kb,
+    forcejoin_kb,
+    history_kb,
     ib,
     invoice_kb,
     main_menu_kb,
@@ -30,9 +42,12 @@ from keyboards.inline import (
     payment_methods_kb,
     player_kb,
     proof_gallery_kb,
+    rate_kb,
     review_request_kb,
     screenshot_prompt_kb,
     stuff_user_kb,
+    wishlist_kb,
+    with_coupon_button,
 )
 from states.admin_states import PaymentStates, UserStates
 from utils.payments import (
@@ -57,6 +72,7 @@ from utils.security import (
     is_protect_content,
     user_has_access,
 )
+from utils import features
 
 router = Router()
 
@@ -112,6 +128,70 @@ def _total_price(stuffs: list[dict]) -> float:
     return sum(float(s.get("price", 0) or 0) for s in stuffs)
 
 
+async def _menu_extras() -> list[tuple[str, str]]:
+    extras: list[tuple[str, str]] = []
+    if await features.is_on("history"):
+        extras.append(("History", "shistory"))
+    if await features.is_on("wishlist"):
+        extras.append(("Wishlist", "swishlist"))
+    if await features.is_on("checkin"):
+        extras.append(("Check-in", "scheckin"))
+    if await features.is_on("support"):
+        extras.append(("Support", "sticket"))
+    return extras
+
+
+async def _maintenance_gate(message: Message | CallbackQuery) -> bool:
+    """True when a non-admin is blocked by maintenance mode."""
+    user = message.from_user
+    if user is None or await is_admin(user.id):
+        return False
+    if await features.is_on("maintenance"):
+        if isinstance(message, CallbackQuery):
+            await message.answer(features.maintenance_text(), show_alert=True)
+        else:
+            await message.answer(
+                features.maintenance_text(), reply_markup=menu_button_kb()
+            )
+        return True
+    return False
+
+
+async def _coupon_from_state(state: FSMContext) -> dict | None:
+    if not await features.is_on("coupons"):
+        return None
+    data = await state.get_data()
+    coupon = data.get("coupon")
+    if isinstance(coupon, dict) and features.coupon_applies(coupon):
+        return coupon
+    return None
+
+
+def _pay_total(state_data: dict, total: float) -> float:
+    coupon = state_data.get("coupon")
+    if isinstance(coupon, dict):
+        saved = features.coupon_discount(total, coupon)
+        return round(total - saved, 2)
+    return total
+
+
+async def _forcejoin_gate(callback: CallbackQuery) -> bool:
+    allowed, channel = await features.forcejoin_allowed(
+        callback.bot, callback.from_user.id
+    )
+    if allowed:
+        return True
+    await callback.answer("Join the channel first", show_alert=True)
+    try:
+        await callback.message.answer(
+            features.join_prompt(channel),
+            reply_markup=forcejoin_kb(channel),
+        )
+    except TelegramAPIError:
+        logger.exception("Force-join prompt failed")
+    return False
+
+
 def _stuff_info_text(stuff: dict, has_access: bool) -> str:
     text = f"<b>{html.escape(stuff.get('name', '?'))}</b>"
     description = stuff.get("description")
@@ -133,7 +213,7 @@ def _stuff_info_text(stuff: dict, has_access: bool) -> str:
 async def _show_menu(message: Message, edit: bool = False) -> None:
     admin = await is_admin(message.from_user.id)
     start = await get_start_message()
-    markup = main_menu_kb(admin)
+    markup = main_menu_kb(admin, extra=await _menu_extras())
     text = start.get("text") or DEFAULT_START_TEXT
 
     if edit:
@@ -173,7 +253,7 @@ async def _show_menu(message: Message, edit: bool = False) -> None:
 
 async def _answer_menu(target: Message, admin: bool = False) -> None:
     start = await get_start_message()
-    markup = main_menu_kb(admin)
+    markup = main_menu_kb(admin, extra=await _menu_extras())
     text = start.get("text") or DEFAULT_START_TEXT
     if target.photo or target.video or target.document:
         try:
@@ -245,19 +325,75 @@ async def _send_stuff_item(message: Message, stuff: dict, pos: int) -> None:
 # ---------------------------------------------------------------- start / menu
 
 
+def _parse_ref(text: str | None) -> int | None:
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        try:
+            return int(parts[1][4:])
+        except ValueError:
+            return None
+    return None
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if await _maintenance_gate(message):
+        return
+    admin = await is_admin(message.from_user.id)
     try:
-        await ensure_user(message.from_user)
+        user = await ensure_user(message.from_user)
     except Exception:
         logger.exception("ensure_user failed on /start")
+        user = None
+
+    referrer = _parse_ref(message.text)
+    if referrer and referrer != message.from_user.id:
+        refdata = await features.get_refdata(message.from_user.id)
+        purchased = (user or {}).get("purchased") or []
+        if not refdata and not purchased:
+            await features.set_refdata(
+                message.from_user.id, {"by": referrer, "credited": False}
+            )
+
+    new_names: list[str] = []
+    if not admin and await features.is_on("welcomeback"):
+        previous = await get_setting(f"laststart_{message.from_user.id}", "")
+        if previous:
+            try:
+                moment = datetime.fromisoformat(previous)
+            except ValueError:
+                moment = None
+            if moment is not None:
+                for stuff in await list_stuffs():
+                    raw = stuff.get("created_at")
+                    if not raw:
+                        continue
+                    try:
+                        created = datetime.fromisoformat(str(raw))
+                    except ValueError:
+                        continue
+                    if created > moment:
+                        new_names.append(str(stuff.get("name", "?")))
+        await set_setting(
+            f"laststart_{message.from_user.id}",
+            datetime.now().isoformat(),
+        )
+
     await _show_menu(message)
+    if new_names:
+        names = ", ".join(new_names[:5])
+        await message.answer(
+            f"👋 <b>Welcome back!</b>\nNew stuffs since your last visit:\n"
+            f"• {html.escape(names)}"
+        )
 
 
 @router.callback_query(F.data == "smenu")
 async def cb_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    if await _maintenance_gate(callback):
+        return
     await callback.answer()
     await _answer_menu(callback.message, admin=await is_admin(callback.from_user.id))
 
@@ -284,11 +420,20 @@ async def cb_catalog(callback: CallbackQuery) -> None:
     if not items:
         await callback.answer("No stuffs yet", show_alert=True)
         return
+    show_category = await features.is_on("categories")
+    if show_category:
+        items = sorted(
+            items,
+            key=lambda s: (
+                str(s.get("category") or "").lower(),
+                str(s.get("name") or "").lower(),
+            ),
+        )
     await callback.answer()
     await _edit_or_send(
         callback.message,
         "<b>Stuffs</b>\n\nChoose a stuff:",
-        catalog_kb(items, admin=admin),
+        catalog_kb(items, admin=admin, show_category=show_category),
     )
 
 
@@ -299,9 +444,18 @@ async def cmd_catalog(message: Message) -> None:
     if not items:
         await message.answer("No stuffs yet.")
         return
+    show_category = await features.is_on("categories")
+    if show_category:
+        items = sorted(
+            items,
+            key=lambda s: (
+                str(s.get("category") or "").lower(),
+                str(s.get("name") or "").lower(),
+            ),
+        )
     await message.answer(
         "<b>Stuffs</b>\n\nChoose a stuff:",
-        reply_markup=catalog_kb(items, admin=admin),
+        reply_markup=catalog_kb(items, admin=admin, show_category=show_category),
     )
 
 
@@ -329,19 +483,40 @@ async def cb_my_stuffs(callback: CallbackQuery) -> None:
     )
 
 
-@router.callback_query(F.data.startswith("sstuf:"))
-async def cb_stuff(callback: CallbackQuery) -> None:
-    stuff_id = callback.data.split(":", 1)[1]
+async def _render_stuff_page(
+    callback: CallbackQuery, stuff_id: str, answer: bool = True
+) -> None:
     stuff = await get_stuff(stuff_id)
     if stuff is None:
-        await callback.answer("Stuffs deleted", show_alert=True)
+        if answer:
+            await callback.answer("Stuffs deleted", show_alert=True)
         return
 
     user = await ensure_user(callback.from_user)
     has_access = user_has_access(user, stuff)
-    await callback.answer()
+    if answer:
+        await callback.answer()
     text = _stuff_info_text(stuff, has_access)
-    markup = stuff_user_kb(stuff, has_access)
+    category = str(stuff.get("category") or "").strip()
+    if category and await features.is_on("categories"):
+        text = f"📁 {html.escape(category)}\n{text}"
+    if await features.is_on("reviews"):
+        approved = await features.approved_reviews(stuff["_id"])
+        if approved:
+            text += "\n\n<b>Reviews:</b>\n" + features.reviews_text(approved)
+    markup = stuff_user_kb(
+        stuff,
+        has_access,
+        show_rate=await features.is_on("reviews"),
+        wish_on=await features.is_on("wishlist"),
+        wished=str(stuff["_id"])
+        in set(await features.get_wishlist(callback.from_user.id)),
+        resume_pos=(
+            await features.get_resume(callback.from_user.id, stuff["_id"])
+            if has_access and await features.is_on("resume")
+            else None
+        ),
+    )
     showcase = stuff.get("showcase")
     if showcase:
         try:
@@ -354,6 +529,12 @@ async def cb_stuff(callback: CallbackQuery) -> None:
         except TelegramAPIError:
             logger.exception("Showcase send failed, falling back to text")
     await _edit_or_send(callback.message, text, markup)
+
+
+@router.callback_query(F.data.startswith("sstuf:"))
+async def cb_stuff(callback: CallbackQuery) -> None:
+    stuff_id = callback.data.split(":", 1)[1]
+    await _render_stuff_page(callback, stuff_id)
 
 
 @router.callback_query(F.data.startswith("ales:"))
@@ -382,7 +563,38 @@ async def cb_stuff_item(callback: CallbackQuery) -> None:
         await callback.answer("This stuff requires purchase", show_alert=True)
         return
 
+    if has_access and not lesson.get("is_demo"):
+        if await features.is_on("resume"):
+            await features.set_resume(callback.from_user.id, stuff_id, pos)
+
     await callback.answer()
+    try:
+        await callback.message.delete()
+    except TelegramAPIError:
+        pass
+    await _send_stuff_item(callback.message, stuff, pos)
+
+
+@router.callback_query(F.data.startswith("sresume:"))
+async def cb_resume(callback: CallbackQuery) -> None:
+    stuff_id = callback.data.split(":", 1)[1]
+    if not await features.is_on("resume"):
+        await callback.answer("Resume feature is off", show_alert=True)
+        return
+    stuff = await get_stuff(stuff_id)
+    if stuff is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    pos = await features.get_resume(callback.from_user.id, stuff_id)
+    lessons = stuff.get("lessons", [])
+    if pos is None or not 0 <= pos < len(lessons):
+        await callback.answer("No saved position yet", show_alert=True)
+        return
+    user = await ensure_user(callback.from_user)
+    if not user_has_access(user, stuff):
+        await callback.answer("This stuff requires purchase", show_alert=True)
+        return
+    await callback.answer(f"Resuming at #{pos + 1}")
     try:
         await callback.message.delete()
     except TelegramAPIError:
@@ -598,21 +810,27 @@ async def cb_bselect_buy(callback: CallbackQuery, state: FSMContext) -> None:
         if user_has_access(user, stuffs[0]):
             await callback.answer("You already have access", show_alert=True)
             return
-        await _show_payment_methods(callback, stuffs[0])
+        await _show_payment_methods(callback, stuffs[0], state)
         return
     await callback.answer()
-    await _show_multi_payment_methods(callback, stuffs)
+    await _show_multi_payment_methods(callback, stuffs, state)
 
 
 # ---------------------------------------------------------------- payments
 
 
-async def _show_payment_methods(callback: CallbackQuery, stuff: dict) -> None:
+async def _show_payment_methods(
+    callback: CallbackQuery, stuff: dict, state: FSMContext
+) -> None:
     methods = await get_active_methods()
     user = await ensure_user(callback.from_user)
     balance = float(user.get("balance", 0) or 0)
     price = float(stuff.get("price", 0))
-    can_pay_balance = price > 0 and balance >= price
+    data = await state.get_data()
+    coupon = await _coupon_from_state(state)
+    paid = _pay_total(data, price) if coupon else price
+    can_pay_balance = paid > 0 and balance >= paid
+    await state.update_data(cids=str(stuff["_id"]), cmode="one")
 
     if not methods and not can_pay_balance:
         await _edit_or_send(
@@ -623,6 +841,14 @@ async def _show_payment_methods(callback: CallbackQuery, stuff: dict) -> None:
         return
 
     text = _stuff_info_text(stuff, has_access=False)
+    if coupon:
+        saved = features.coupon_discount(price, coupon)
+        text += (
+            f"\nCoupon <code>{html.escape(str(coupon.get('code')))}</code>: "
+            f"−Rs.{saved:g}"
+        )
+        if paid != price:
+            text += f"\n<b>To pay: Rs.{_price_text(paid)}</b>"
     if balance > 0:
         text += f"\nYour balance: Rs.{balance:g}"
     text += "\n\n<b>Choose a payment method:</b>"
@@ -632,7 +858,7 @@ async def _show_payment_methods(callback: CallbackQuery, stuff: dict) -> None:
         rows.append(
             [
                 ib(
-                    f"Pay from balance (Rs.{price:g})",
+                    f"Pay from balance (Rs.{_price_text(paid)})",
                     f"pbal:{stuff['_id']}",
                     "success",
                 )
@@ -641,18 +867,32 @@ async def _show_payment_methods(callback: CallbackQuery, stuff: dict) -> None:
     if methods:
         rows.extend(payment_methods_kb(str(stuff["_id"]), methods).inline_keyboard)
     rows.append([ib("Back", f"sstuf:{stuff['_id']}", "primary")])
-    await _edit_or_send(callback.message, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if await features.is_on("coupons"):
+        markup = with_coupon_button(
+            markup,
+            (
+                f"Coupon {html.escape(str(coupon.get('code')))} — change"
+                if coupon
+                else "Apply coupon"
+            ),
+        )
+    await _edit_or_send(callback.message, text, markup)
 
 
 async def _show_multi_payment_methods(
-    callback: CallbackQuery, stuffs: list[dict]
+    callback: CallbackQuery, stuffs: list[dict], state: FSMContext
 ) -> None:
     methods = await get_active_methods()
     user = await ensure_user(callback.from_user)
     balance = float(user.get("balance", 0) or 0)
     total = _total_price(stuffs)
-    can_pay_balance = total > 0 and balance >= total
+    data = await state.get_data()
+    coupon = await _coupon_from_state(state)
+    paid = _pay_total(data, total) if coupon else total
+    can_pay_balance = paid > 0 and balance >= paid
     ids_raw = ",".join(str(s["_id"]) for s in stuffs)
+    await state.update_data(cids=ids_raw, cmode="multi")
 
     if not methods and not can_pay_balance:
         await _edit_or_send(
@@ -668,6 +908,13 @@ async def _show_multi_payment_methods(
         f"{names}\n\n"
         f"Total: <b>Rs.{_price_text(total)}</b>"
     )
+    if coupon:
+        saved = features.coupon_discount(total, coupon)
+        text += (
+            f"\nCoupon <code>{html.escape(str(coupon.get('code')))}</code>: "
+            f"−Rs.{saved:g}"
+        )
+        text += f"\n<b>To pay: Rs.{_price_text(paid)}</b>"
     if balance > 0:
         text += f"\nYour balance: Rs.{balance:g}"
     text += "\n\n<b>Choose a payment method:</b>"
@@ -677,8 +924,17 @@ async def _show_multi_payment_methods(
         methods,
         back_cb="bdirect",
         can_pay_balance=can_pay_balance,
-        balance_total=total,
+        balance_total=paid,
     )
+    if await features.is_on("coupons"):
+        markup = with_coupon_button(
+            markup,
+            (
+                f"Coupon {html.escape(str(coupon.get('code')))} — change"
+                if coupon
+                else "Apply coupon"
+            ),
+        )
     await _edit_or_send(callback.message, text, markup)
 
 
@@ -689,9 +945,15 @@ async def cb_pay_from_balance(callback: CallbackQuery, state: FSMContext) -> Non
     if not stuffs:
         await callback.answer("Stuffs deleted", show_alert=True)
         return
+    if not await _forcejoin_gate(callback):
+        return
 
     user = await ensure_user(callback.from_user)
     price = _total_price(stuffs)
+    data = await state.get_data()
+    coupon = await _coupon_from_state(state)
+    if coupon:
+        price = _pay_total(data, price)
     if price <= 0:
         await callback.answer("These stuffs are free", show_alert=True)
         return
@@ -711,7 +973,10 @@ async def cb_pay_from_balance(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.answer("Insufficient balance", show_alert=True)
         return
 
+    coupon_code = str(coupon.get("code")) if coupon else None
     await state.clear()
+    if coupon_code:
+        await features.bump_coupon_usage(coupon_code)
     for stuff in stuffs:
         await grant_access(callback.from_user.id, str(stuff["_id"]))
 
@@ -722,6 +987,8 @@ async def cb_pay_from_balance(callback: CallbackQuery, state: FSMContext) -> Non
         user_full_name=callback.from_user.full_name,
         stuffs=stuffs,
         method=method,
+        amount_override=price,
+        coupon=coupon_code,
     )
     await set_request_status(request["_id"], "approved")
     await notify_log_group(
@@ -762,7 +1029,7 @@ async def cb_buy(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.answer("Stuffs deleted", show_alert=True)
             return
         await callback.answer()
-        await _show_multi_payment_methods(callback, stuffs)
+        await _show_multi_payment_methods(callback, stuffs, state)
         return
     stuff = await get_stuff(raw_ids)
     if stuff is None:
@@ -778,11 +1045,11 @@ async def cb_buy(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await callback.answer()
-    await _show_payment_methods(callback, stuff)
+    await _show_payment_methods(callback, stuff, state)
 
 
 @router.callback_query(F.data.startswith("pm:"))
-async def cb_payment_method(callback: CallbackQuery) -> None:
+async def cb_payment_method(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         _, method_id, raw_ids = callback.data.split(":")
     except ValueError:
@@ -797,14 +1064,19 @@ async def cb_payment_method(callback: CallbackQuery) -> None:
     if not stuffs:
         await callback.answer("Stuffs deleted", show_alert=True)
         return
+    if not await _forcejoin_gate(callback):
+        return
 
     first_id = str(stuffs[0]["_id"])
+    data = await state.get_data()
+    coupon = await _coupon_from_state(state)
     total = _total_price(stuffs)
+    paid = _pay_total(data, total) if coupon else total
     joined_name = " + ".join(s.get("name", "Stuff") for s in stuffs)
     await callback.answer()
 
     if method.get("kind") == "stars":
-        amount = max(1, int(total))
+        amount = max(1, int(paid))
         await callback.bot.send_invoice(
             chat_id=callback.message.chat.id,
             title=joined_name[:255],
@@ -820,13 +1092,21 @@ async def cb_payment_method(callback: CallbackQuery) -> None:
         )
         return
 
-    amount_text = _price_text(total)
+    amount_text = _price_text(paid)
+    coupon_line = ""
+    if coupon and paid != total:
+        saved = features.coupon_discount(total, coupon)
+        coupon_line = (
+            f"\nCoupon <code>{html.escape(str(coupon.get('code')))}</code>: "
+            f"−Rs.{saved:g}"
+        )
 
     if method.get("kind") == "qr" and method.get("qr_file_id"):
         caption = f"<b>{html.escape(method['name'])}</b>"
         if method.get("instructions"):
             caption += f"\n{html.escape(method['instructions'])}"
         caption += f"\n\nAmount: <b>{amount_text}</b>"
+        caption += coupon_line
         caption += (
             "\n\nAfter paying, press <b>“I have paid”</b> "
             "and send your payment screenshot."
@@ -849,6 +1129,7 @@ async def cb_payment_method(callback: CallbackQuery) -> None:
     if method.get("detail"):
         text += f"\n\nAddress:\n<code>{html.escape(method['detail'])}</code>"
     text += f"\n\nAmount: <b>{amount_text}</b>"
+    text += coupon_line
     text += (
         "\n\nAfter paying, press <b>“I have paid”</b> "
         "and send your payment screenshot."
@@ -916,12 +1197,22 @@ async def on_screenshot(message: Message, state: FSMContext) -> None:
     if method is None:
         method = {"name": "Unknown", "kind": "crypto"}
 
+    total = _total_price(stuffs)
+    paid = _pay_total(data, total)
+    coupon_code = None
+    coupon = data.get("coupon")
+    if isinstance(coupon, dict) and paid != total:
+        coupon_code = str(coupon.get("code"))
+        await features.bump_coupon_usage(coupon_code)
+
     request = await create_payment_request(
         user_tg_id=message.from_user.id,
         user_username=message.from_user.username,
         user_full_name=message.from_user.full_name,
         stuffs=stuffs,
         method=method,
+        amount_override=paid if coupon_code else None,
+        coupon=coupon_code,
     )
     await attach_screenshot(request["_id"], file_id)
     await state.clear()
@@ -988,6 +1279,15 @@ async def on_successful_payment(message: Message, state: FSMContext) -> None:
     name = " + ".join(s.get("name", "stuff") for s in stuffs) or "stuff"
     stars = payment.total_amount
 
+    state_data = await state.get_data()
+    full_total = _total_price(stuffs)
+    paid_total = _pay_total(state_data, full_total)
+    coupon_code = None
+    if isinstance(state_data.get("coupon"), dict) and paid_total != full_total:
+        coupon_code = str(state_data["coupon"].get("code"))
+        await features.bump_coupon_usage(coupon_code)
+    override = float(stars) if coupon_code else None
+
     if receiver:
         request = await create_payment_request(
             user_tg_id=message.from_user.id,
@@ -995,6 +1295,8 @@ async def on_successful_payment(message: Message, state: FSMContext) -> None:
             user_full_name=message.from_user.full_name,
             stuffs=stuffs,
             method=stars_method,
+            amount_override=override,
+            coupon=coupon_code,
         )
         await notify_log_group(
             message.bot,
@@ -1027,6 +1329,8 @@ async def on_successful_payment(message: Message, state: FSMContext) -> None:
         user_full_name=message.from_user.full_name,
         stuffs=stuffs,
         method=stars_method,
+        amount_override=override,
+        coupon=coupon_code,
     )
     await set_request_status(request["_id"], "approved")
 
@@ -1106,6 +1410,331 @@ async def _handle_stars_proof(
     )
 
 
+# ---------------------------------------------------------------- features
+
+
+class _MsgAsCallback:
+    """Shim so payment renderers can be reused from plain messages."""
+
+    def __init__(self, message: Message) -> None:
+        self.message = message
+        self.from_user = message.from_user
+
+
+async def _methods_fresh(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    cids = str(data.get("cids") or "")
+    stuffs = await _fetch_stuffs(cids)
+    if not stuffs:
+        await message.answer(
+            "These stuffs are no longer available.",
+            reply_markup=menu_button_kb(),
+        )
+        return
+    shim = _MsgAsCallback(message)
+    if data.get("cmode") == "multi" or "," in cids:
+        await _show_multi_payment_methods(shim, stuffs, state)
+    else:
+        await _show_payment_methods(shim, stuffs[0], state)
+
+
+async def _rerender_methods(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    cids = str(data.get("cids") or "")
+    stuffs = await _fetch_stuffs(cids)
+    if not stuffs:
+        await _edit_or_send(
+            callback.message,
+            "These stuffs are no longer available.",
+            menu_button_kb(),
+        )
+        return
+    if data.get("cmode") == "multi" or "," in cids:
+        await _show_multi_payment_methods(callback, stuffs, state)
+    else:
+        await _show_payment_methods(callback, stuffs[0], state)
+
+
+@router.callback_query(F.data == "scoupon")
+async def cb_coupon_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("coupons"):
+        await callback.answer("Coupons are disabled", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("coupon"):
+        await state.update_data(coupon=None)
+        await callback.answer("Coupon removed")
+        await _rerender_methods(callback, state)
+        return
+    await state.set_state(UserStates.coupon_code)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "🎟 <b>Apply coupon</b>\n\nSend your coupon code:",
+        coupon_entry_kb(),
+    )
+
+
+@router.callback_query(F.data == "scouponback")
+async def cb_coupon_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await _rerender_methods(callback, state)
+
+
+@router.message(UserStates.coupon_code, F.text)
+async def coupon_code_receive(message: Message, state: FSMContext) -> None:
+    if not await features.is_on("coupons"):
+        await state.clear()
+        await message.answer("Coupons are disabled.", reply_markup=menu_button_kb())
+        return
+    code = (message.text or "").strip()
+    coupon = await features.find_coupon(code)
+    if coupon is None:
+        await message.answer("That coupon does not exist. Check the code:")
+        return
+    if not features.coupon_applies(coupon):
+        await message.answer("That coupon is no longer valid. Send another code:")
+        return
+    await state.update_data(coupon=dict(coupon))
+    await state.set_state(None)
+    data = await state.get_data()
+    stuffs = await _fetch_stuffs(str(data.get("cids") or ""))
+    total = _total_price(stuffs)
+    saved = features.coupon_discount(total, coupon)
+    await message.answer(
+        f"✅ Coupon <code>{html.escape(str(coupon.get('code')))}</code> applied — "
+        f"you save <b>Rs.{saved:g}</b>.\n\n"
+        "Tap a payment method below:"
+    )
+    await _methods_fresh(message, state)
+
+
+# ---------------------------------------------------------------- check-in
+
+
+@router.callback_query(F.data == "scheckin")
+async def cb_checkin(callback: CallbackQuery) -> None:
+    if not await features.is_on("checkin"):
+        await callback.answer("Check-in is disabled", show_alert=True)
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    claimed = await features.get_checkin(callback.from_user.id) == today
+    bonus = await features.get_checkin_bonus()
+    await callback.answer()
+    text = (
+        f"📅 <b>Daily check-in</b>\n\n"
+        f"Bonus: <b>Rs.{bonus:g}</b>\n\n"
+        + ("You already claimed today — come back tomorrow!"
+           if claimed else "Tap <b>Claim bonus</b> to collect.")
+    )
+    await _edit_or_send(callback.message, text, checkin_kb(claimed))
+
+
+@router.callback_query(F.data == "schecknone")
+async def cb_checkin_none(callback: CallbackQuery) -> None:
+    await callback.answer("Come back tomorrow")
+
+
+@router.callback_query(F.data == "scheckok")
+async def cb_checkin_claim(callback: CallbackQuery) -> None:
+    if not await features.is_on("checkin"):
+        await callback.answer("Check-in is disabled", show_alert=True)
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    if await features.get_checkin(callback.from_user.id) == today:
+        await callback.answer("Already claimed today", show_alert=True)
+        return
+    bonus = await features.get_checkin_bonus()
+    await features.set_checkin(callback.from_user.id, today)
+    await add_balance(callback.from_user.id, bonus)
+    await callback.answer(f"Claimed Rs.{bonus:g}")
+    await _edit_or_send(
+        callback.message,
+        f"✅ <b>Check-in claimed</b>\n\nRs.{bonus:g} added to your balance.",
+        checkin_kb(True),
+    )
+
+
+# --------------------------------------------------------------- wishlist
+
+
+@router.callback_query(F.data == "swishlist")
+async def cb_wishlist(callback: CallbackQuery) -> None:
+    if not await features.is_on("wishlist"):
+        await callback.answer("Wishlist is disabled", show_alert=True)
+        return
+    ids = await features.get_wishlist(callback.from_user.id)
+    stuffs = []
+    for stuff_id in ids:
+        doc = await get_stuff(stuff_id)
+        if doc is not None:
+            stuffs.append(doc)
+    await callback.answer()
+    if not stuffs:
+        await _edit_or_send(
+            callback.message,
+            "💛 <b>Wishlist</b>\n\nYour wishlist is empty. "
+            "Open a stuff and press Wishlist +.",
+            menu_button_kb(),
+        )
+        return
+    await _edit_or_send(
+        callback.message,
+        f"💛 <b>Wishlist</b> ({len(stuffs)})",
+        wishlist_kb(stuffs),
+    )
+
+
+@router.callback_query(F.data.startswith("wish:"))
+async def cb_wish_toggle(callback: CallbackQuery) -> None:
+    if not await features.is_on("wishlist"):
+        await callback.answer("Wishlist is disabled", show_alert=True)
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    added = await features.toggle_wishlist(callback.from_user.id, stuff_id)
+    await callback.answer("Added to wishlist" if added else "Removed from wishlist")
+    await _render_stuff_page(callback, stuff_id, answer=False)
+
+
+# ---------------------------------------------------------------- history
+
+
+@router.callback_query(F.data == "shistory")
+async def cb_history(callback: CallbackQuery) -> None:
+    if not await features.is_on("history"):
+        await callback.answer("History is disabled", show_alert=True)
+        return
+    rows = await features.purchase_history(callback.from_user.id)
+    names = {str(s["_id"]): str(s.get("name", "?")) for s in await list_stuffs()}
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        features.history_text(rows, names),
+        history_kb(),
+    )
+
+
+# ---------------------------------------------------------------- reviews
+
+
+@router.callback_query(F.data.startswith("srate:"))
+async def cb_rate_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("reviews"):
+        await callback.answer("Reviews are disabled", show_alert=True)
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    await state.update_data(rate_stuff=str(stuff_id))
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "⭐ <b>Rate this stuff</b>\n\nHow many stars?",
+        rate_kb(str(stuff_id)),
+    )
+
+
+@router.callback_query(F.data.startswith("rvs:"))
+async def cb_rate_stars(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("reviews"):
+        await callback.answer("Reviews are disabled", show_alert=True)
+        return
+    try:
+        _, stuff_id, stars_raw = callback.data.split(":")
+        stars = int(stars_raw)
+    except ValueError:
+        await callback.answer("Invalid request", show_alert=True)
+        return
+    await state.update_data(rate_stuff=str(stuff_id), rate_stars=stars)
+    await state.set_state(UserStates.rate_text)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"⭐ You chose <b>{stars}</b> star(s).\n\n"
+        "Send a short review text (or send <code>/skip</code>):",
+        menu_button_kb(),
+    )
+
+
+@router.message(UserStates.rate_text, F.text)
+async def rate_text_receive(message: Message, state: FSMContext) -> None:
+    if not await features.is_on("reviews"):
+        await state.clear()
+        await message.answer("Reviews are disabled.", reply_markup=menu_button_kb())
+        return
+    data = await state.get_data()
+    stuff_id = str(data.get("rate_stuff") or "")
+    stars = int(data.get("rate_stars") or 5)
+    text = (message.text or "").strip()
+    if text.lower() in ("/skip", "skip"):
+        text = ""
+    if not stuff_id:
+        await state.clear()
+        await message.answer("Session expired.", reply_markup=menu_button_kb())
+        return
+    await features.add_review(stuff_id, message.from_user.id, stars, text)
+    await features.audit(
+        f"Review submitted: {stars} star(s) for stuff {stuff_id}"
+    )
+    await state.clear()
+    await message.answer(
+        "✅ Thanks! Your review is waiting for approval.",
+        reply_markup=menu_button_kb(),
+    )
+
+
+# ---------------------------------------------------------------- support
+
+
+@router.callback_query(F.data == "sticket")
+async def cb_support_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("support"):
+        await callback.answer("Support is disabled", show_alert=True)
+        return
+    await state.set_state(UserStates.support_text)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "💬 <b>Support</b>\n\n"
+        "Write your message and send it — the admin will reply "
+        "here in the bot.",
+        menu_button_kb(),
+    )
+
+
+@router.message(UserStates.support_text, F.text)
+async def support_receive(message: Message, state: FSMContext) -> None:
+    if not await features.is_on("support"):
+        await state.clear()
+        await message.answer("Support is disabled.", reply_markup=menu_button_kb())
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Send a message:")
+        return
+    await features.add_ticket(message.from_user, text)
+    await features.audit(f"Support ticket from {message.from_user.id}")
+    await state.clear()
+    await message.answer(
+        "✅ Ticket created! The admin will reply here.",
+        reply_markup=menu_button_kb(),
+    )
+
+
+# --------------------------------------------------------------- forcejoin
+
+
+@router.callback_query(F.data == "fjcheck")
+async def cb_forcejoin_check(callback: CallbackQuery) -> None:
+    allowed, _channel = await features.forcejoin_allowed(
+        callback.bot, callback.from_user.id
+    )
+    if allowed:
+        await callback.answer(
+            "Joined — tap the button again to continue", show_alert=True
+        )
+    else:
+        await callback.answer("You have not joined yet", show_alert=True)
+
+
 # ---------------------------------------------------------------- fallback
 
 
@@ -1113,6 +1742,15 @@ async def _handle_stars_proof(
 async def fallback(message: Message) -> None:
     if message.from_user and await is_admin(message.from_user.id):
         return
+    if await _maintenance_gate(message):
+        return
+    if await features.is_on("faq"):
+        answer = features.faq_answer(
+            await features.get_faq(), message.text or ""
+        )
+        if answer:
+            await message.answer(answer, reply_markup=menu_button_kb())
+            return
     await message.answer(
         "Please use the buttons below the message.",
         reply_markup=menu_button_kb(),

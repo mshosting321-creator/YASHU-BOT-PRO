@@ -12,6 +12,7 @@ from database.store import backend_name, close_db, connect_db
 from handlers import admin, user
 from utils.clones import start_existing_clones, stop_all
 from utils.payments import ensure_default_methods
+from utils.scheduler import start_scheduler, stop_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,11 @@ async def main() -> None:
         raise
 
     logger.info("Bot started (database: %s)", backend_name())
+    start_scheduler(bot)
     try:
         await dp.start_polling(bot)
     finally:
+        await stop_scheduler()
         await stop_all()
         await bot.session.close()
         await close_db()

@@ -129,6 +129,7 @@ async def copy_main_to(tag: str) -> None:
                 s.get("lessons") or [],
                 s.get("showcase"),
                 s.get("proofs") or [],
+                category=s.get("category", ""),
             )
         for m in methods:
             payload = {k: v for k, v in m.items() if k not in ("_id", "bot")}
@@ -443,6 +444,7 @@ async def create_stuff(
     lessons: list[dict],
     showcase: str | None = None,
     proofs: list[str] | None = None,
+    category: str = "",
 ) -> dict:
     if _mongo_mode:
         from pymongo.errors import DuplicateKeyError as MongoDuplicateKeyError
@@ -457,6 +459,8 @@ async def create_stuff(
             "showcase": showcase,
             "proofs": proofs or [],
             "bot": current_tag(),
+            "category": category or "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
             result = await mongo.stuffs().insert_one(doc)
@@ -467,7 +471,8 @@ async def create_stuff(
     from database import sqlite_backend
 
     return await sqlite_backend.create_stuff(
-        name, description, price, lessons, showcase, proofs, current_tag()
+        name, description, price, lessons, showcase, proofs, current_tag(),
+        category or "",
     )
 
 
@@ -526,6 +531,19 @@ async def set_stuff_price(stuff_id, price: float) -> None:
     from database import sqlite_backend
 
     await sqlite_backend.set_stuff_price(stuff_id, price)
+
+
+async def set_stuff_category(stuff_id, category: str) -> None:
+    if _mongo_mode:
+        from database import mongo
+
+        await mongo.stuffs().update_one(
+            {"_id": _oid(stuff_id)}, {"$set": {"category": category or ""}}
+        )
+        return
+    from database import sqlite_backend
+
+    await sqlite_backend.set_stuff_category(stuff_id, category)
 
 
 async def delete_stuff(stuff_id) -> None:
