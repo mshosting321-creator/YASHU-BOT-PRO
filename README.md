@@ -70,6 +70,38 @@ python main.py
 
 Stop with `Ctrl+C`. The SQLite file `course_bot.db` is created automatically on first run.
 
+## Moving your existing database to a server
+
+Your data (stuffs, users, purchases, settings) lives in `course_bot.db`. Database files
+are **not** part of the GitHub repo (`.gitignore`), so a fresh `git clone` on a new
+machine starts with an empty database. Move the file yourself:
+
+**Option A - keep using the file (simplest):**
+
+1. Upload `course_bot.db` to the server next to `main.py`:
+
+   ```bash
+   scp course_bot.db root@YOUR_SERVER:~/YASHU-BOT/
+   ```
+
+   (on Windows use WinSCP or any SFTP client instead of `scp`)
+2. In `.env` keep: `DATABASE_URL=sqlite:///course_bot.db`
+3. Restart the bot - all your old data is there.
+
+**Option B - import into MongoDB (when `.env` has a `mongodb+srv://...` URL):**
+
+1. Upload `course_bot.db` to the server as above.
+2. Make sure `.env` contains your MongoDB `DATABASE_URL`.
+3. Run once:
+
+   ```bash
+   python tools/import_sqlite.py course_bot.db
+   ```
+
+   Old ids are remapped automatically: purchases, balances, pending payment
+   requests, methods and settings all keep working. The command is safe to re-run
+   (nothing is imported twice).
+
 ## Hosting
 
 For every host: set the environment variables below (never commit `.env`).
@@ -235,6 +267,7 @@ added inside the panel). Everyone else gets no response from `/admin`.
   showcase image, proofs, preview, delete, **Receive direct** (all media sent into the chat)
   and **Download ZIP** (one archive with `info.txt`, videos, demo files, cover and proofs).
 - **Start message** — set text / photo / video, preview, clear media.
+- **Help text** — edit the text users see when they press the **Help** button (HTML supported).
 - **Admins** — add by forwarded message or numeric id, remove (env admins cannot be removed).
 - **Payment methods** — crypto address or QR (UPI/INR) methods, Telegram Stars with
   *Star receiver @username*, activate/deactivate/delete.
@@ -263,6 +296,7 @@ Then choose the mode:
 The clone runs inside the same process as the main bot: same admin IDs, same users and
 balance, but its own stuffs, payment methods and settings (scoped automatically in the
 same database). Removing a clone from the panel stops it and deletes only its own data.
+The message containing the clone bot token is deleted automatically right after you send it.
 
 ### ZIP upload format
 

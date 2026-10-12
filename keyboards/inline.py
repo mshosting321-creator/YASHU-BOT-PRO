@@ -431,7 +431,10 @@ def panel_inline_kb() -> InlineKeyboardMarkup:
                 ib("VPS", "apnl:vps", "primary"),
             ],
             [ib("Clone bots", "apnl:clones", "success")],
-            [ib("Menu", "smenu", "primary")],
+            [
+                ib("Help text", "apnl:helptext", "primary"),
+                ib("Menu", "smenu", "primary"),
+            ],
         ]
     )
 

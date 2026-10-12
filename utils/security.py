@@ -101,3 +101,24 @@ async def set_start_media(media_type: str, media_id: str) -> None:
 async def clear_start_media() -> None:
     await set_setting("start_media_type", "")
     await set_setting("start_media_id", "")
+
+
+DEFAULT_HELP_TEXT = (
+    "<b>Help</b>\n\n"
+    "• <b>Stuffs</b> — browse stuffs and open them.\n"
+    "• Demo stuffs are free for everyone.\n"
+    "• <b>My Stuffs</b> — your purchased and free stuffs.\n"
+    "• To buy: pick a payment method, pay, press "
+    "<b>“I have paid”</b> and send a payment screenshot. "
+    "Stuffs arrive instantly after approval.\n\n"
+    "If something breaks, contact the administrator."
+)
+
+
+async def get_help_text() -> str:
+    text = await get_setting("help_text", DEFAULT_HELP_TEXT)
+    return text or DEFAULT_HELP_TEXT
+
+
+async def set_help_text(text: str) -> None:
+    await set_setting("help_text", text)

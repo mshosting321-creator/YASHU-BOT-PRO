@@ -335,7 +335,7 @@ async def list_requests() -> list[dict]:
 
         rows = await sqlite_backend.list_request_rows()
     tag = current_tag()
-    return [r for r in rows if r.get("bot", "main") == tag]
+    return [r for r in rows if (r.get("bot") or "main") == tag]
 
 
 # ---------------------------------------------------------------- admins
@@ -400,7 +400,7 @@ async def list_stuffs() -> list[dict]:
 
         rows = await sqlite_backend.list_stuffs()
     tag = current_tag()
-    return [s for s in rows if s.get("bot", "main") == tag]
+    return [s for s in rows if (s.get("bot") or "main") == tag]
 
 
 async def get_stuff(stuff_id) -> dict | None:
@@ -415,7 +415,7 @@ async def get_stuff(stuff_id) -> dict | None:
         from database import sqlite_backend
 
         doc = await sqlite_backend.get_stuff(stuff_id)
-    if doc is None or doc.get("bot", "main") != current_tag():
+    if doc is None or (doc.get("bot") or "main") != current_tag():
         return None
     return doc
 
@@ -431,7 +431,7 @@ async def get_stuff_by_name(name: str) -> dict | None:
         rows = await sqlite_backend.find_stuffs_by_name(name)
     tag = current_tag()
     for row in rows:
-        if row.get("bot", "main") == tag:
+        if (row.get("bot") or "main") == tag:
             return row
     return None
 
@@ -599,7 +599,7 @@ async def list_methods(active_only: bool = False) -> list[dict]:
 
         rows = await sqlite_backend.list_method_rows(False)
     tag = current_tag()
-    rows = [m for m in rows if m.get("bot", "main") == tag]
+    rows = [m for m in rows if (m.get("bot") or "main") == tag]
     if active_only:
         rows = [m for m in rows if m.get("is_active")]
     rows.sort(key=lambda d: (d.get("sort_order", 0), d.get("_id", 0)))
@@ -618,7 +618,7 @@ async def get_method(method_id) -> dict | None:
         from database import sqlite_backend
 
         doc = await sqlite_backend.get_method_row(method_id)
-    if doc is None or doc.get("bot", "main") != current_tag():
+    if doc is None or (doc.get("bot") or "main") != current_tag():
         return None
     return doc
 
@@ -677,7 +677,7 @@ async def get_request(request_id) -> dict | None:
         from database import sqlite_backend
 
         doc = await sqlite_backend.get_request_row(request_id)
-    if doc is None or doc.get("bot", "main") != current_tag():
+    if doc is None or (doc.get("bot") or "main") != current_tag():
         return None
     return doc
 

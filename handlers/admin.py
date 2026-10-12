@@ -80,12 +80,14 @@ from utils.payments import (
 )
 from utils.security import (
     add_admin,
+    get_help_text,
     get_start_message,
     get_admin_list,
     find_user,
     is_admin,
     is_protect_content,
     remove_admin,
+    set_help_text,
     set_protect_content,
     set_start_media,
     set_start_text,
@@ -349,6 +351,17 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
         await _edit_or_send(target, vps_text(), _refresh_kb("bvps"))
     elif key == "clones":
         await _show_clones(target)
+    elif key == "helptext":
+        current = await get_help_text()
+        await state.set_state(AdminStates.set_help_text)
+        await _edit_or_send(
+            target,
+            "ℹ️ <b>Help text</b>\n\nCurrent:\n"
+            + current
+            + "\n\nSend the new Help text (HTML supported). "
+            "It replaces what users see when they press Help.",
+            cancel_inline_kb("aback"),
+        )
     elif key == "cladd":
         await state.set_state(AdminStates.clone_pending)
         await _edit_or_send(
@@ -361,6 +374,21 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------- clone bots
+
+
+@router.message(AdminStates.set_help_text, F.text)
+async def help_text_set(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    await set_help_text(text)
+    await state.clear()
+    await message.answer(
+        "✅ Help text saved. Users will see it when they press Help.",
+        reply_markup=panel_inline_kb(),
+    )
 
 
 async def _show_clones(target: Message) -> None:
@@ -388,6 +416,10 @@ async def cmd_clone(message: Message, state: FSMContext) -> None:
         )
         return
     token = parts[1].strip()
+    try:
+        await message.delete()
+    except TelegramAPIError:
+        logger.info("Could not delete the /clone message")
     me = await clone_manager.validate_token(token)
     if me is None:
         await message.answer("Invalid token or bot unreachable.")
@@ -411,6 +443,10 @@ async def clone_token_text(message: Message, state: FSMContext) -> None:
     token = (message.text or "").strip()
     if not token:
         return
+    try:
+        await message.delete()
+    except TelegramAPIError:
+        logger.info("Could not delete the token message")
     me = await clone_manager.validate_token(token)
     if me is None:
         await message.answer(
@@ -1523,8 +1559,9 @@ async def do_add_admin(message: Message, state: FSMContext) -> None:
     tg_id: int | None = None
     username: str | None = None
 
-    source = message.forward_from_user
-    if source is not None:
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None and getattr(origin, "type", "") == "user":
+        source = origin.sender_user
         tg_id = source.id
         username = source.username
     elif message.text and message.text.strip().lstrip("-").isdigit():
@@ -1817,15 +1854,15 @@ async def cb_method_view(callback: CallbackQuery) -> None:
     await callback.answer()
     await _edit_or_send(
         callback.message,
-        _method_view_text(method),
+        await _method_view_text(method),
         payment_method_view_kb(
             method_id, bool(method.get("is_active")), str(method.get("kind") or "")
         ),
     )
 
 
-def _method_view_text(method: dict) -> str:
-    kind = method_kind_label(method)
+async def _method_view_text(method: dict) -> str:
+    kind = await method_kind_label(method)
     status = "🟢 active" if method.get("is_active") else "⚪ inactive"
     text = (
         f"💳 <b>{html.escape(method.get('name', '?'))}</b>\n\n"
@@ -1867,7 +1904,7 @@ async def cb_method_toggle(callback: CallbackQuery) -> None:
     await callback.answer("Saved")
     await _edit_or_send(
         callback.message,
-        _method_view_text(method),
+        await _method_view_text(method),
         payment_method_view_kb(method_id, new_value, str(method.get("kind") or "")),
     )
 
@@ -1897,7 +1934,14 @@ async def log_group_capture(message: Message, state: FSMContext) -> None:
         return
 
     chat_id: int | None = None
-    source = message.forward_from_chat or message.sender_chat
+    source = None
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None and getattr(origin, "type", "") == "chat":
+        source = origin.sender_chat
+    elif origin is not None and getattr(origin, "type", "") == "channel":
+        source = origin.chat
+    if source is None:
+        source = message.forward_from_chat or message.sender_chat
     if source is not None and source.type in {"group", "supergroup", "channel"}:
         chat_id = source.id
     elif message.text and message.text.strip().lstrip("-").isdigit():

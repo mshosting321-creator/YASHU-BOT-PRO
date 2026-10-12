@@ -30,6 +30,7 @@ class AdminStates(StatesGroup):
     balance_op = State()
     broadcast_text = State()
     clone_pending = State()
+    set_help_text = State()
 
 
 class PaymentStates(StatesGroup):

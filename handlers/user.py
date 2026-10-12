@@ -49,6 +49,7 @@ from utils.payments import (
 )
 from utils.security import (
     ensure_user,
+    get_help_text,
     get_start_message,
     grant_access,
     is_admin,
@@ -263,32 +264,14 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "shelp")
 async def cb_help(callback: CallbackQuery) -> None:
-    text = (
-        "<b>Help</b>\n\n"
-        "• <b>Stuffs</b> — browse stuffs and open them.\n"
-        "• Demo stuffs are free for everyone.\n"
-        "• <b>My Stuffs</b> — your purchased and free stuffs.\n"
-        "• To buy: pick a payment method, pay, press "
-        "<b>“I have paid”</b> and send a payment screenshot. "
-        "Stuffs arrive instantly after approval.\n\n"
-        "If something breaks, contact the administrator."
-    )
+    text = await get_help_text()
     await callback.answer()
     await _edit_or_send(callback.message, text, menu_button_kb())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(
-        "<b>Help</b>\n\n"
-        "• <b>Stuffs</b> — browse stuffs and open them.\n"
-        "• Demo stuffs are free for everyone.\n"
-        "• <b>My Stuffs</b> — your purchased and free stuffs.\n"
-        "• To buy: pick a payment method, pay, press "
-        "<b>“I have paid”</b> and send a payment screenshot. "
-        "Stuffs arrive instantly after approval.",
-        reply_markup=menu_button_kb(),
-    )
+    await message.answer(await get_help_text(), reply_markup=menu_button_kb())
 
 
 # ---------------------------------------------------------------- catalog
