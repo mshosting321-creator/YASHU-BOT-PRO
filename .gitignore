@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Uploads / archives
+*.zip
+media_temp/*
+!media_temp/.gitkeep
+
+# Editors
+.idea/
+.vscode/

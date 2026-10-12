@@ -1,0 +1,19 @@
+{
+  "name": "yashu-bot",
+  "description": "Telegram course-selling bot: stuffs catalog, demo lessons, proofs gallery, manual payments with screenshot approval and Telegram Stars.",
+  "keywords": ["telegram", "bot", "aiogram", "courses", "stars"],
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Telegram bot token from @BotFather, format 123456:ABC-DEF...",
+      "required": false
+    },
+    "ADMIN_ID": {
+      "description": "Your numeric Telegram user id (comma-separated for several admins)",
+      "required": false
+    },
+    "DATABASE_URL": {
+      "description": "sqlite:///course_bot.db (local default) or mongodb+srv://user:pass@cluster0.mongodb.net/course_bot",
+      "required": false
+    }
+  }
+}
