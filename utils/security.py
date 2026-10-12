@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from aiogram.types import User as TgUser
 
 from config import AUTH_ADMIN_IDS
@@ -58,11 +60,29 @@ def user_has_access(user: dict | None, stuff: dict) -> bool:
         return False
     from database.store import purchase_key
 
-    return purchase_key(stuff["_id"]) in {str(x) for x in user.get("purchased", [])}
+    key = purchase_key(stuff["_id"])
+    if key not in {str(x) for x in user.get("purchased", [])}:
+        return False
+    raw = (user.get("expires") or {}).get(key)
+    if raw:
+        from utils.features import parse_expiry
+
+        until = parse_expiry(raw)
+        if until is not None and until <= datetime.now(timezone.utc):
+            return False
+    return True
 
 
 async def grant_access(tg_id: int, stuff_id: str) -> None:
     await store_grant_access(tg_id, str(stuff_id))
+    try:
+        from utils import features
+
+        await features.apply_validity(tg_id, stuff_id)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("apply_validity failed")
 
 
 async def is_protect_content() -> bool:

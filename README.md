@@ -55,9 +55,23 @@ can switch them on or off without touching the code:
 - **Audit log** — important admin actions (creates, deletes, approvals, toggles) are logged.
 - **Stats graph** — 7-day order bars added to the Stats page.
 - **CSV export** — download the user list as a CSV file.
+- **Gift codes** — create wallet voucher codes (`BONUS50` …) in the panel; users redeem
+  them from the menu and the balance is added instantly.
+- **Catalog search** — users type a keyword and get matching stuffs (name/description/category).
+- **Cashback** — buyers get a configurable % of each approved order back in their wallet.
+- **Purchase receipts** — buyers receive a receipt message (order id, item, amount, date)
+  after every approval.
+- **Auto-approve** — payment claims up to a configured amount are approved and delivered
+  instantly (default OFF; set the max on the Features page).
+- **Anti-flood** — users sending messages too fast get a gentle warning (default OFF).
+- **Auto-reject old claims** — pending payment claims older than 48h are rejected and the
+  user is notified (default OFF).
+- **Access validity** — per-stuff day limit: buyers keep access only for N days after
+  purchase (set it with the **Validity** button on the stuff page; countdown shows on the
+  stuff page; 0 = forever).
 
-Amount settings (referral bonus, check-in bonus, force-join channel, backup/report times)
-are edited from buttons on the same Features page.
+Amount settings (referral bonus, check-in bonus, force-join channel, backup/report times,
+cashback %, auto-approve max) are edited from buttons on the same Features page.
 
 ## Requirements
 
@@ -298,7 +312,8 @@ added inside the panel). Everyone else gets no response from `/admin`.
 
 - **Add stuff** — *Upload from ZIP* or *Direct video forwarding* (send videos/photos one by one).
 - **Stuffs** — open a stuff: add videos, demo list (tap to toggle demo/paid), rename, price,
-  showcase image, proofs, **category**, preview, delete, **Receive direct** (all media sent into the chat)
+  showcase image, proofs, **category**, **validity (days)**, preview, delete,
+  **Receive direct** (all media sent into the chat)
   and **Download ZIP** (one archive with `info.txt`, videos, demo files, cover and proofs).
 - **Start message** — set text / photo / video, preview, clear media.
 - **Help text** — edit the text users see when they press the **Help** button (HTML supported).
@@ -313,12 +328,14 @@ added inside the panel). Everyone else gets no response from `/admin`.
   (plus a 7-day order graph when the graph feature is ON).
 - **VPS** — CPU, RAM, disk, process usage, bot/system uptime, active database backend.
 - **Clone bots** — list every clone with running/stopped status; start, stop or remove them.
-- **Features** — 20 ON/OFF toggles (coupons, referral, force-join, check-in, wishlist,
+- **Features** — 28 ON/OFF toggles (coupons, referral, force-join, check-in, wishlist,
   history, reviews, categories, welcome back, FAQ, auto backup, daily report, scheduler,
-  maintenance, resume, leaderboard, support, audit, graph, CSV) plus the buttons for
-  referral bonus, check-in bonus, force-join channel, backup time, report time,
-  Leaderboard, Audit log and CSV export.
+  maintenance, resume, leaderboard, support, audit, graph, CSV, gift codes, search,
+  cashback, receipts, auto-approve, anti-flood, auto-reject, access validity) plus the
+  buttons for referral bonus, check-in bonus, force-join channel, backup time, report time,
+  cashback %, auto-approve max, Leaderboard, Audit log and CSV export.
 - **Coupons** — add a coupon (code, percent, max uses), toggle it on/off, delete it.
+- **Gift codes** — wallet voucher codes: add (amount + code or random), disable, delete.
 - **Reviews** — approve or delete user reviews.
 - **Support** — open tickets: view, reply to the user, close.
 - **Schedule** — pending scheduled broadcasts: add or delete.

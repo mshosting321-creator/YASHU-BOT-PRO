@@ -4,17 +4,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import AUTH_ADMIN_IDS, DATABASE_URL
 from utils import features
-from utils.payments import get_log_chat_id, notify_log_group
+from utils.payments import (
+    get_log_chat_id,
+    notify_log_group,
+    set_request_status,
+)
 
 logger = logging.getLogger(__name__)
 
 _task: asyncio.Task | None = None
 _fired: set[str] = set()
+_last_stale: float = 0.0
 TICK_SECONDS = 30
+STALE_HOURS = 48
 
 
 def start_scheduler(bot) -> None:
@@ -53,10 +59,55 @@ async def _tick(bot) -> None:
     local = now.astimezone()
     if await features.is_on("scheduler"):
         await _run_due_bcasts(bot)
+    if await features.is_on("stale_reject"):
+        await _reject_stale(bot, now)
     if await features.is_on("autobackup"):
         await _maybe_fire("backup", await features.get_backup_time(), local, _backup, bot)
     if await features.is_on("dailyreport"):
         await _maybe_fire("report", await features.get_report_time(), local, _report, bot)
+
+
+async def _reject_stale(bot, now: datetime) -> None:
+    """Reject pending payment claims older than STALE_HOURS."""
+    global _last_stale
+    if now.timestamp() - _last_stale < 600:
+        return
+    _last_stale = now.timestamp()
+    from database.store import list_requests
+
+    for request in await list_requests():
+        if str(request.get("status")) != "pending":
+            continue
+        created = features.parse_expiry(request.get("created_at"))
+        if created is None or now - created < timedelta(hours=STALE_HOURS):
+            continue
+        try:
+            await set_request_status(request["_id"], "rejected")
+        except Exception:
+            logger.exception("stale reject failed for %s", request.get("_id"))
+            continue
+        try:
+            await bot.send_message(
+                request["user_tg_id"],
+                "⌛ <b>Payment claim expired</b>\n\n"
+                "Your pending payment claim was not reviewed in time and "
+                "has been rejected. If you already paid, contact the admin "
+                "or try again.",
+            )
+        except Exception:
+            pass
+        await notify_log_group(
+            bot,
+            text=(
+                f"⌛ Auto-rejected expired order {request['_id']}\n"
+                f"Amount: Rs.{request.get('amount', '?')} — "
+                f"user {request.get('user_tg_id')}"
+            ),
+        )
+        await features.audit(
+            f"Auto-rejected stale claim {request['_id']} "
+            f"(Rs.{request.get('amount', '?')})"
+        )
 
 
 async def _maybe_fire(action: str, hhmm: str, local: datetime, fn, bot) -> None:

@@ -246,16 +246,17 @@ def admin_stuff_view_kb(stuff_id: str, lesson_count: int) -> InlineKeyboardMarku
             ],
             [
                 ib("Category", f"scat:{stuff_id}", "primary"),
-                ib("Preview", f"sstuf:{stuff_id}", "primary"),
+                ib("Validity", f"sdays:{stuff_id}", "primary"),
             ],
             [
                 ib("Receive direct", f"sget:{stuff_id}", "success"),
                 ib("Download ZIP", f"szipdl:{stuff_id}", "success"),
             ],
             [
+                ib("Preview", f"sstuf:{stuff_id}", "primary"),
                 ib("Delete", f"sdel:{stuff_id}", "danger"),
-                ib("Stuffs", "sadmin:stuffs", "primary"),
             ],
+            [ib("Stuffs", "sadmin:stuffs", "primary")],
         ]
     )
 
@@ -465,9 +466,10 @@ def panel_inline_kb() -> InlineKeyboardMarkup:
                 ib("VPS", "apnl:vps", "primary"),
             ],
             [ib("Clone bots", "apnl:clones", "success")],
+            [ib("Features", "apnl:features", "success")],
             [
-                ib("Features", "apnl:features", "success"),
                 ib("Coupons", "apnl:coupons", "primary"),
+                ib("Gift codes", "apnl:gifts", "primary"),
             ],
             [
                 ib("Reviews", "apnl:reviews", "primary"),
@@ -646,6 +648,12 @@ def features_kb(
         ]
     )
     rows.append([ib("Report time", "featcfg:rtime", "primary")])
+    rows.append(
+        [
+            ib("Cashback %", "featcfg:cashback", "primary"),
+            ib("Auto-approve max", "featcfg:autoapp", "primary"),
+        ]
+    )
     view_row = []
     if show_leaderboard:
         view_row.append(ib("Leaderboard", "featlb", "primary"))
@@ -678,6 +686,30 @@ def coupons_kb(coupons: list[dict]) -> InlineKeyboardMarkup:
     if not coupons:
         rows.append([ib("No coupons yet", "cpnone", "primary")])
     rows.append([ib("Add coupon", "cpadd", "success")])
+    rows.append([ib("Panel", "aback", "primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def gifts_kb(codes: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, entry in enumerate(codes[:20]):
+        code = str(entry.get("code", "?")).upper()
+        try:
+            amount = float(entry.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        state = "used" if entry.get("used") else (
+            "on" if entry.get("active", True) else "off"
+        )
+        rows.append(
+            [
+                ib(f"{code} Rs.{amount:g} ({state})"[:64], f"goff:{index}", "primary"),
+                ib("Delete", f"gdel:{index}", "danger"),
+            ]
+        )
+    if not codes:
+        rows.append([ib("No gift codes yet", "gnone", "primary")])
+    rows.append([ib("Add gift code", "gadd", "success")])
     rows.append([ib("Panel", "aback", "primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

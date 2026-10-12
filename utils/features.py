@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from database.store import (
     add_balance,
@@ -35,8 +35,16 @@ FEATURES: dict[str, tuple[str, str]] = {
     "audit": ("Audit log", "Track important admin actions"),
     "graph": ("Stats graph", "7-day activity bars in the stats page"),
     "csv": ("CSV export", "Export the user list as a CSV file"),
+    "giftcodes": ("Gift codes", "Admin-made wallet codes users redeem"),
+    "search": ("Catalog search", "Users search stuffs by keyword"),
+    "cashback": ("Cashback", "Buyers earn back a % of each order in wallet"),
+    "receipts": ("Purchase receipts", "Buyers get a receipt after approval"),
+    "autoapprove": ("Auto-approve", "Small payment claims are approved instantly"),
+    "antiflood": ("Anti-flood", "Warn users who send messages too fast"),
+    "stale_reject": ("Auto-reject old claims", "Expire pending claims after 48 hours"),
+    "expiry": ("Access validity", "Limit purchases to N days per stuff"),
 }
-DEFAULT_OFF = {"maintenance"}
+DEFAULT_OFF = {"maintenance", "autoapprove", "antiflood", "stale_reject"}
 FLAGS_KEY = "feature_flags"
 
 COUPONS_KEY = "coupons"
@@ -568,3 +576,232 @@ async def drop_bcast(entry_id: str) -> None:
 async def was_request_approved(request_id) -> bool:
     doc = await get_request(request_id)
     return bool(doc) and str(doc.get("status")) == "approved"
+
+
+# --------------------------------------------------------------- gift codes
+
+GIFTCODES_KEY = "giftcodes"
+
+
+async def get_giftcodes() -> list[dict]:
+    data = await load_json(GIFTCODES_KEY, [])
+    return data if isinstance(data, list) else []
+
+
+async def save_giftcodes(codes: list[dict]) -> None:
+    await save_json(GIFTCODES_KEY, codes)
+
+
+async def redeem_gift(code: str, tg_id: int) -> tuple[bool, float, str]:
+    """Try to redeem a code. Returns (ok, amount, reason)."""
+    if not await is_on("giftcodes"):
+        return False, 0.0, "disabled"
+    needle = (code or "").strip().lower()
+    if not needle:
+        return False, 0.0, "empty"
+    codes = await get_giftcodes()
+    for entry in codes:
+        if str(entry.get("code", "")).lower() != needle:
+            continue
+        if not entry.get("active", True):
+            return False, 0.0, "inactive"
+        if entry.get("used"):
+            return False, 0.0, "used"
+        try:
+            amount = float(entry.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            return False, 0.0, "empty"
+        entry["used"] = True
+        entry["redeemed_by"] = int(tg_id)
+        entry["redeemed_at"] = datetime.now(timezone.utc).isoformat()
+        await save_giftcodes(codes)
+        await add_balance(int(tg_id), amount)
+        await audit(f"Gift code {entry.get('code')} redeemed (+Rs.{amount:g})")
+        return True, amount, "ok"
+    return False, 0.0, "unknown"
+
+
+# ---------------------------------------------------------------- cashback
+
+
+async def get_cashback_pct() -> float:
+    raw = await get_setting("cashback_pct", "0")
+    try:
+        return max(0.0, min(100.0, float(raw)))
+    except ValueError:
+        return 0.0
+
+
+async def set_cashback_pct(value: float) -> None:
+    await set_setting("cashback_pct", f"{value:g}")
+
+
+async def credit_cashback(request_doc: dict | None) -> None:
+    """Called once when an order is approved: refund a % to the buyer's wallet."""
+    if not request_doc:
+        return
+    try:
+        if not await is_on("cashback"):
+            return
+    except Exception:
+        return
+    buyer = request_doc.get("user_tg_id")
+    if not buyer:
+        return
+    pct = await get_cashback_pct()
+    if pct <= 0:
+        return
+    try:
+        amount = float(request_doc.get("amount", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    bonus = round(amount * pct / 100.0, 2)
+    if bonus <= 0:
+        return
+    try:
+        await add_balance(int(buyer), bonus)
+    except Exception:
+        return
+    await audit(f"Cashback: +Rs.{bonus:g} to {buyer} ({pct:g}% of Rs.{amount:g})")
+
+
+# ------------------------------------------------------------------ search
+
+
+def search_stuffs(stuffs: list[dict], query: str, limit: int = 20) -> list[dict]:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return []
+    words = [w for w in needle.split() if w]
+    matches = []
+    for stuff in stuffs:
+        haystack = " ".join(
+            str(stuff.get(field) or "")
+            for field in ("name", "description", "category")
+        ).lower()
+        if all(word in haystack for word in words):
+            matches.append(stuff)
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+# ---------------------------------------------------------------- receipts
+
+
+def receipt_text(request: dict) -> str:
+    order = request.get("request_no", request.get("_id"))
+    created = _iso(request.get("created_at")) or datetime.now(timezone.utc)
+    amount = request.get("amount", 0)
+    method = request.get("method_name") or "-"
+    item = request.get("stuff_name") or "Stuff"
+    coupon = request.get("coupon")
+    lines = [
+        "<b>🧾 Payment receipt</b>\n",
+        f"Order ID: <code>{html.escape(str(order))}</code>",
+        f"Item: {html.escape(str(item))}",
+        f"Amount: {format_amount_text(amount, str(method))}",
+        f"Method: {html.escape(str(method))}",
+        f"Date: {created:%d %b %Y %H:%M}",
+        "Status: ✅ Paid",
+    ]
+    if coupon:
+        lines.insert(4, f"Coupon: <code>{html.escape(str(coupon))}</code>")
+    return "\n".join(lines)
+
+
+def format_amount_text(amount, method_name: str = "") -> str:
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+    shown = int(value) if value == int(value) else value
+    if "star" in method_name.lower() or "telegram" in method_name.lower():
+        return f"{shown} ⭐"
+    return f"Rs.{shown}"
+
+
+# ------------------------------------------------------------- autoapprove
+
+
+async def get_autoapprove_max() -> float:
+    raw = await get_setting("autoapprove_max", "0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+async def set_autoapprove_max(value: float) -> None:
+    await set_setting("autoapprove_max", f"{value:g}")
+
+
+# ------------------------------------------------------------ access expiry
+
+
+async def get_stuff_days(stuff_id) -> int:
+    raw = await get_setting(f"days_{stuff_id}", "0")
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return 0
+
+
+async def set_stuff_days(stuff_id, days: int) -> None:
+    await set_setting(f"days_{stuff_id}", str(max(0, int(days))))
+
+
+def parse_expiry(raw) -> datetime | None:
+    moment = _iso(raw)
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+async def apply_validity(tg_id: int, stuff_id) -> None:
+    """Give a limited access window after a purchase (feature: expiry)."""
+    try:
+        if not await is_on("expiry"):
+            return
+    except Exception:
+        return
+    days = await get_stuff_days(stuff_id)
+    if days <= 0:
+        return
+    from database.store import purchase_key, set_purchase_expiry
+
+    key = purchase_key(stuff_id)
+    user = await find_user(int(tg_id))
+    existing = parse_expiry((user or {}).get("expires", {}).get(key))
+    base = datetime.now(timezone.utc)
+    if existing and existing > base:
+        base = existing
+    until = base + timedelta(days=days)
+    try:
+        await set_purchase_expiry(int(tg_id), stuff_id, until.isoformat())
+    except Exception:
+        return
+
+
+def expiry_line(user: dict | None, stuff: dict) -> str | None:
+    """Human-readable validity line for a purchased stuff, or None."""
+    if not user:
+        return None
+    from database.store import purchase_key
+
+    raw = (user.get("expires") or {}).get(purchase_key(stuff["_id"]))
+    until = parse_expiry(raw)
+    if until is None:
+        return None
+    left = until - datetime.now(timezone.utc)
+    if left.total_seconds() <= 0:
+        return "Access expired"
+    if left.days > 0:
+        span = f"{left.days}d left"
+    else:
+        span = f"{max(1, int(left.seconds // 3600))}h left"
+    return f"Access valid until {until:%d %b %Y} ({span})"

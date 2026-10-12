@@ -137,6 +137,12 @@ async def set_request_status(request_id, status: str) -> dict | None:
             await features.credit_referral(doc)
         except Exception:
             logger.exception("Referral credit failed")
+        try:
+            from utils import features
+
+            await features.credit_cashback(doc)
+        except Exception:
+            logger.exception("Cashback credit failed")
     return doc
 
 

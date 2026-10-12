@@ -39,6 +39,7 @@ async def connect(url: str) -> None:
     for _migration in (
         "ALTER TABLE users ADD COLUMN balance REAL NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN expires TEXT NOT NULL DEFAULT '{}'",
     ):
         try:
             await _db.execute(_migration)
@@ -483,7 +484,16 @@ def _user_row(row) -> dict:
         "purchased": _loads_list(row["purchased"]),
         "balance": float(row["balance"]),
         "banned": bool(row["banned"]),
+        "expires": _loads_dict(row["expires"]),
     }
+
+
+def _loads_dict(value) -> dict:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 async def ensure_user_row(tg_id: int, username: str | None, full_name: str | None) -> dict:
@@ -532,6 +542,26 @@ async def is_banned_row(tg_id: int) -> bool:
     )
     row = await cursor.fetchone()
     return bool(row["banned"]) if row else False
+
+
+async def set_expiry_row(tg_id: int, key: str, iso: str) -> None:
+    cursor = await _conn().execute(
+        "SELECT expires FROM users WHERE tg_id = ?", (tg_id,)
+    )
+    row = await cursor.fetchone()
+    expires = _loads_dict(row["expires"]) if row else {}
+    expires[key] = iso
+    if row is None:
+        await _conn().execute(
+            "INSERT INTO users (tg_id, expires) VALUES (?, ?)",
+            (tg_id, json.dumps(expires)),
+        )
+    else:
+        await _conn().execute(
+            "UPDATE users SET expires = ? WHERE tg_id = ?",
+            (json.dumps(expires), tg_id),
+        )
+    await _conn().commit()
 
 
 async def set_banned_row(tg_id: int, value: bool) -> None:

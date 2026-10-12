@@ -39,12 +39,17 @@ class AdminStates(StatesGroup):
     coupon_code = State()
     coupon_percent = State()
     coupon_max = State()
+    gift_amount = State()
+    gift_code = State()
     faq_question = State()
     faq_answer = State()
     ticket_reply = State()
     schedule_text = State()
     schedule_time = State()
     set_category = State()
+    set_days = State()
+    cfg_cashback = State()
+    cfg_autoapprove = State()
 
 
 class PaymentStates(StatesGroup):
@@ -56,3 +61,5 @@ class UserStates(StatesGroup):
     coupon_code = State()
     rate_text = State()
     support_text = State()
+    search_query = State()
+    gift_code = State()

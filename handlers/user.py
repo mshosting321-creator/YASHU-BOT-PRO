@@ -1,5 +1,6 @@
 import html
 import logging
+import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 
@@ -107,6 +108,54 @@ router.message.middleware(BanMiddleware())
 router.callback_query.middleware(BanMiddleware())
 
 
+class FloodMiddleware(BaseMiddleware):
+    """Warns users who send more than 8 messages within 10 seconds."""
+
+    hits: dict[int, list[float]] = {}
+    warned: dict[int, float] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: dict[str, Any],
+    ) -> Any:
+        try:
+            flood_on = await features.is_on("antiflood")
+        except Exception:
+            flood_on = False
+        if not flood_on:
+            return await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        if await is_admin(user.id):
+            return await handler(event, data)
+        now = time.monotonic()
+        bucket = [t for t in self.hits.get(user.id, []) if now - t < 10.0]
+        bucket.append(now)
+        if len(self.hits) > 5000:
+            self.hits.clear()
+        self.hits[user.id] = bucket
+        if len(bucket) <= 8:
+            return await handler(event, data)
+        last = self.warned.get(user.id, 0.0)
+        if now - last > 60.0:
+            self.warned[user.id] = now
+            if len(self.warned) > 5000:
+                self.warned.clear()
+            try:
+                await event.answer(
+                    "You are sending messages too fast. Please wait a moment."
+                )
+            except Exception:
+                pass
+        return None
+
+
+router.message.middleware(FloodMiddleware())
+
+
 def _price_text(price: float) -> str:
     return str(int(price)) if price == int(price) else str(price)
 
@@ -138,6 +187,10 @@ async def _menu_extras() -> list[tuple[str, str]]:
         extras.append(("Check-in", "scheckin"))
     if await features.is_on("support"):
         extras.append(("Support", "sticket"))
+    if await features.is_on("search"):
+        extras.append(("Search", "ssearch"))
+    if await features.is_on("giftcodes"):
+        extras.append(("Gift code", "sgift"))
     return extras
 
 
@@ -497,6 +550,10 @@ async def _render_stuff_page(
     if answer:
         await callback.answer()
     text = _stuff_info_text(stuff, has_access)
+    if has_access and float(stuff.get("price", 0) or 0) > 0:
+        validity = features.expiry_line(user, stuff)
+        if validity:
+            text += f"\n{html.escape(validity)}"
     category = str(stuff.get("category") or "").strip()
     if category and await features.is_on("categories"):
         text = f"📁 {html.escape(category)}\n{text}"
@@ -995,6 +1052,11 @@ async def cb_pay_from_balance(callback: CallbackQuery, state: FSMContext) -> Non
         callback.bot,
         text=build_transaction_text(request, "Delivered"),
     )
+    if await features.is_on("receipts"):
+        try:
+            await callback.message.answer(features.receipt_text(request))
+        except TelegramAPIError:
+            logger.exception("Receipt send failed")
 
     await callback.answer("Paid from balance")
     await _edit_or_send(
@@ -1217,6 +1279,16 @@ async def on_screenshot(message: Message, state: FSMContext) -> None:
     await attach_screenshot(request["_id"], file_id)
     await state.clear()
 
+    if await features.is_on("autoapprove"):
+        limit = await features.get_autoapprove_max()
+        try:
+            amount = float(request.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if limit > 0 and amount <= limit:
+            await _auto_approve_request(message, request, stuffs)
+            return
+
     user_line = (
         f"@{html.escape(message.from_user.username)}"
         if message.from_user.username
@@ -1248,6 +1320,46 @@ async def on_screenshot(message: Message, state: FSMContext) -> None:
         "to you instantly after approval.",
         reply_markup=menu_button_kb(),
     )
+
+
+async def _auto_approve_request(
+    message: Message, request: dict, stuffs: list[dict]
+) -> None:
+    """Approve and deliver a claim that is under the auto-approve limit."""
+    for stuff in stuffs:
+        await grant_access(message.from_user.id, str(stuff["_id"]))
+    await set_request_status(request["_id"], "approved")
+    await features.audit(
+        f"Auto-approved: Rs.{request.get('amount', '?')} from "
+        f"{request.get('user_tg_id')}"
+    )
+    await notify_log_group(
+        message.bot,
+        text=build_transaction_text(request, "Auto-approved"),
+    )
+    await message.answer(
+        "✅ <b>Payment auto-approved!</b>\n\n"
+        f"Delivering “{html.escape(request.get('stuff_name') or 'your stuff')}”…",
+        reply_markup=menu_button_kb(),
+    )
+    if await features.is_on("receipts"):
+        try:
+            await message.answer(features.receipt_text(request))
+        except TelegramAPIError:
+            logger.exception("Receipt send failed")
+    total_sent = 0
+    total_failed = 0
+    for stuff in stuffs:
+        sent, failed = await deliver_stuff(message.bot, message.chat.id, stuff)
+        total_sent += sent
+        total_failed += failed
+    if stuffs:
+        done = f"<b>Delivered!</b> Media sent: {total_sent}."
+        if total_failed:
+            done += f"\nFailed: {total_failed}."
+        await message.answer(
+            done, reply_markup=after_payment_kb(str(stuffs[0]["_id"]))
+        )
 
 
 # ---------------------------------------------------------------- stars
@@ -1338,6 +1450,11 @@ async def on_successful_payment(message: Message, state: FSMContext) -> None:
         message.bot,
         text=build_transaction_text(request, "Delivered"),
     )
+    if await features.is_on("receipts"):
+        try:
+            await message.answer(features.receipt_text(request))
+        except TelegramAPIError:
+            logger.exception("Receipt send failed")
 
     await message.answer(
         f"<b>Payment successful!</b>\n\n"
@@ -1716,6 +1833,91 @@ async def support_receive(message: Message, state: FSMContext) -> None:
     await message.answer(
         "✅ Ticket created! The admin will reply here.",
         reply_markup=menu_button_kb(),
+    )
+
+
+# ------------------------------------------------------------------ search
+
+
+@router.callback_query(F.data == "ssearch")
+async def cb_search_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("search"):
+        await callback.answer("Search is disabled", show_alert=True)
+        return
+    await state.set_state(UserStates.search_query)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "🔍 <b>Search</b>\n\nSend a keyword to find stuffs:",
+        menu_button_kb(),
+    )
+
+
+@router.message(UserStates.search_query, F.text)
+async def search_receive(message: Message, state: FSMContext) -> None:
+    if not await features.is_on("search"):
+        await state.clear()
+        await message.answer("Search is disabled.", reply_markup=menu_button_kb())
+        return
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Send a keyword to search:")
+        return
+    matches = features.search_stuffs(await list_stuffs(), query)
+    await state.clear()
+    if not matches:
+        await message.answer(
+            f"No stuffs match “{html.escape(query)}”.",
+            reply_markup=menu_button_kb(),
+        )
+        return
+    admin = await is_admin(message.from_user.id)
+    await message.answer(
+        f"🔍 Results for <b>{html.escape(query)}</b> ({len(matches)}):",
+        reply_markup=catalog_kb(matches, admin=admin),
+    )
+
+
+# --------------------------------------------------------------- gift codes
+
+
+@router.callback_query(F.data == "sgift")
+async def cb_gift_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await features.is_on("giftcodes"):
+        await callback.answer("Gift codes are disabled", show_alert=True)
+        return
+    await state.set_state(UserStates.gift_code)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "🎁 <b>Gift code</b>\n\nSend the code to redeem it for wallet balance:",
+        menu_button_kb(),
+    )
+
+
+@router.message(UserStates.gift_code, F.text)
+async def gift_redeem(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    await state.clear()
+    if not await features.is_on("giftcodes"):
+        await message.answer(
+            "Gift codes are disabled.", reply_markup=menu_button_kb()
+        )
+        return
+    ok, amount, reason = await features.redeem_gift(code, message.from_user.id)
+    if ok:
+        await message.answer(
+            f"✅ Gift code redeemed!\n\nRs.{amount:g} added to your balance.",
+            reply_markup=menu_button_kb(),
+        )
+        return
+    texts = {
+        "used": "That code was already used.",
+        "inactive": "That code is currently disabled.",
+        "unknown": "Invalid code.",
+    }
+    await message.answer(
+        texts.get(reason, "Invalid code."), reply_markup=menu_button_kb()
     )
 
 

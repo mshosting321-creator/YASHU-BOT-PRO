@@ -61,6 +61,7 @@ from keyboards.inline import (
     demo_step_kb,
     faq_kb,
     features_kb,
+    gifts_kb,
     ib,
     kind_crypto_kb,
     log_group_kb,
@@ -171,6 +172,12 @@ async def _edit_or_send(target: Message, text: str, reply_markup=None) -> None:
             await target.answer(text, reply_markup=reply_markup)
 
 
+def _validity_label(days: int) -> str:
+    if days <= 0:
+        return "forever"
+    return f"{days} day(s)"
+
+
 async def _stuff_view_text(stuff: dict) -> str:
     price = stuff.get("price", 0)
     price_text = f"{int(price)} ⭐" if price > 0 else "free"
@@ -180,6 +187,7 @@ async def _stuff_view_text(stuff: dict) -> str:
         f"<b>{html.escape(stuff.get('name', '?'))}</b>\n\n"
         f"Price: {price_text}\n"
         f"Category: {html.escape(stuff.get('category') or '—')}\n"
+        f"Validity: {_validity_label(await features.get_stuff_days(stuff['_id']))}\n"
         f"Stuffs: {len(lessons)} (demo: {demo_count})\n"
         f"Showcase: {'yes' if stuff.get('showcase') else 'no'}\n"
         f"Proofs: {len(stuff.get('proofs') or [])}"
@@ -389,6 +397,8 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
         await _show_features(target)
     elif key == "coupons":
         await _show_coupons(target)
+    elif key == "gifts":
+        await _show_gifts(target)
     elif key == "reviews":
         await _show_reviews(target)
     elif key == "support":
@@ -2090,6 +2100,14 @@ async def cb_approve(callback: CallbackQuery) -> None:
     except TelegramAPIError:
         logger.exception("Could not notify user %s", request.get("user_tg_id"))
 
+    if await features.is_on("receipts"):
+        try:
+            await callback.bot.send_message(
+                request["user_tg_id"], features.receipt_text(request)
+            )
+        except TelegramAPIError:
+            logger.exception("Receipt send failed for %s", request.get("user_tg_id"))
+
     total_sent = 0
     total_failed = 0
     first_stuff_id: str | None = None
@@ -2817,6 +2835,27 @@ async def cb_feat_config(callback: CallbackQuery, state: FSMContext) -> None:
             "Send the daily report time as <code>HH:MM</code> (server local time):",
             cancel_inline_kb("apnl:features"),
         )
+    elif key == "cashback":
+        current = await features.get_cashback_pct()
+        await state.set_state(AdminStates.cfg_cashback)
+        await _edit_or_send(
+            target,
+            f"💰 <b>Cashback %</b>\n\nCurrent: {current:g}%\n\n"
+            "Send the percent (0–100) buyers get back in wallet on each "
+            "approved order:",
+            cancel_inline_kb("apnl:features"),
+        )
+    elif key == "autoapp":
+        current = await features.get_autoapprove_max()
+        await state.set_state(AdminStates.cfg_autoapprove)
+        await _edit_or_send(
+            target,
+            f"⚡ <b>Auto-approve max</b>\n\nCurrent: Rs.{current:g}\n\n"
+            "Payment claims up to this amount are approved and delivered "
+            "instantly (screenshot still required).\n"
+            "Send an amount, or <code>0</code> to disable:",
+            cancel_inline_kb("apnl:features"),
+        )
 
 
 async def _features_done(message: Message, state: FSMContext, note: str) -> None:
@@ -2897,6 +2936,45 @@ async def cfg_report_time_save(message: Message, state: FSMContext) -> None:
     await features.set_report_time(value)
     await features.audit(f"Report time set to {value}")
     await _features_done(message, state, f"Report time set to {value}")
+
+
+@router.message(AdminStates.cfg_cashback, F.text)
+async def cfg_cashback_save(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a number, e.g. 10")
+        return
+    if not 0 <= value <= 100:
+        await message.answer("Percent must be between 0 and 100")
+        return
+    await features.set_cashback_pct(value)
+    await features.audit(f"Cashback set to {value:g}%")
+    await _features_done(message, state, f"Cashback set to {value:g}%")
+
+
+@router.message(AdminStates.cfg_autoapprove, F.text)
+async def cfg_autoapprove_save(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a number, e.g. 100")
+        return
+    if value < 0:
+        await message.answer("Value must be 0 or more")
+        return
+    await features.set_autoapprove_max(value)
+    await features.audit(f"Auto-approve max set to Rs.{value:g}")
+    note = (
+        f"Auto-approve max set to Rs.{value:g}"
+        if value > 0
+        else "Auto-approve disabled (max = 0)"
+    )
+    await _features_done(message, state, note)
 
 
 @router.callback_query(F.data == "featlb")
@@ -3139,6 +3217,160 @@ async def cb_coupon_delete(callback: CallbackQuery) -> None:
     await features.audit(f"Coupon {removed.get('code')} deleted")
     await callback.answer("Deleted")
     await _show_coupons(callback.message)
+
+
+# ---------------------------------------------------------------- gift codes
+
+
+def _gifts_text(codes: list[dict]) -> str:
+    if not codes:
+        return (
+            "🎁 <b>Gift codes</b>\n\n"
+            "No codes yet. Tap Add gift code to create one.\n"
+            "Users redeem codes from the menu and get wallet balance."
+        )
+    lines = ["🎁 <b>Gift codes</b>\n"]
+    for entry in codes:
+        code = str(entry.get("code", "?")).upper()
+        try:
+            amount = float(entry.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if entry.get("used"):
+            state = "used"
+        else:
+            state = "on" if entry.get("active", True) else "off"
+        lines.append(f"• <code>{code}</code> — Rs.{amount:g} [{state}]")
+    return "\n".join(lines)
+
+
+async def _show_gifts(target: Message) -> None:
+    codes = await features.get_giftcodes()
+    await _edit_or_send(target, _gifts_text(codes), gifts_kb(codes))
+
+
+@router.callback_query(F.data == "gadd")
+async def cb_gift_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.set_state(AdminStates.gift_amount)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "➕ <b>Add gift code</b>\n\nSend the wallet amount (in Rs.):",
+        cancel_inline_kb("apnl:gifts"),
+    )
+
+
+@router.callback_query(F.data == "gnone")
+async def cb_gift_none(callback: CallbackQuery) -> None:
+    await callback.answer("Press Add gift code to create one")
+
+
+@router.message(AdminStates.gift_amount, F.text)
+async def gift_amount_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    try:
+        amount = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a number, e.g. 50")
+        return
+    if amount <= 0:
+        await message.answer("Amount must be more than 0")
+        return
+    await state.update_data(gift_amount=round(amount, 2))
+    await state.set_state(AdminStates.gift_code)
+    await message.answer(
+        f"Amount: Rs.{amount:g}\n\n"
+        "Send the code (3–32 letters/numbers), or <code>skip</code> "
+        "to generate a random one:"
+    )
+
+
+@router.message(AdminStates.gift_code, F.text)
+async def gift_code_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip().upper()
+    if raw.lower() == "skip":
+        code = uuid.uuid4().hex[:10].upper()
+    else:
+        code = raw
+        if not 3 <= len(code) <= 32 or not code.replace("-", "").isalnum():
+            await message.answer(
+                "Send a code like BONUS50 (3-32 letters/numbers), or skip"
+            )
+            return
+    for entry in await features.get_giftcodes():
+        if str(entry.get("code", "")).lower() == code.lower():
+            await message.answer("That code already exists")
+            return
+    data = await state.get_data()
+    codes = await features.get_giftcodes()
+    codes.append(
+        {
+            "code": code,
+            "amount": float(data.get("gift_amount", 0) or 0),
+            "used": False,
+            "active": True,
+        }
+    )
+    await features.save_giftcodes(codes)
+    await features.audit(
+        f"Gift code {code} created (Rs.{float(data.get('gift_amount', 0) or 0):g})"
+    )
+    await state.clear()
+    await message.answer(
+        f"✅ Gift code <code>{html.escape(code)}</code> created.",
+        reply_markup=panel_inline_kb(),
+    )
+    await _show_gifts(message)
+
+
+@router.callback_query(F.data.startswith("goff:"))
+async def cb_gift_toggle(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    try:
+        index = int(callback.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer()
+        return
+    codes = await features.get_giftcodes()
+    if not 0 <= index < len(codes):
+        await callback.answer("Code not found", show_alert=True)
+        return
+    if codes[index].get("used"):
+        await callback.answer("Already redeemed", show_alert=True)
+        return
+    codes[index]["active"] = not codes[index].get("active", True)
+    await features.save_giftcodes(codes)
+    await callback.answer("Toggled")
+    await _show_gifts(callback.message)
+
+
+@router.callback_query(F.data.startswith("gdel:"))
+async def cb_gift_delete(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    try:
+        index = int(callback.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer()
+        return
+    codes = await features.get_giftcodes()
+    if not 0 <= index < len(codes):
+        await callback.answer("Code not found", show_alert=True)
+        return
+    removed = codes.pop(index)
+    await features.save_giftcodes(codes)
+    await features.audit(f"Gift code {removed.get('code')} deleted")
+    await callback.answer("Deleted")
+    await _show_gifts(callback.message)
 
 
 # ---------------------------------------------------------------- reviews
@@ -3601,6 +3833,65 @@ async def category_set(message: Message, state: FSMContext) -> None:
         return
     await message.answer(
         f"✅ Category set to <b>{html.escape(value or '—')}</b>",
+    )
+    await _edit_or_send(
+        message, await _stuff_view_text(stuff),
+        admin_stuff_view_kb(str(stuff["_id"]), len(stuff.get("lessons") or [])),
+    )
+
+
+# ---------------------------------------------------------------- validity
+
+
+@router.callback_query(F.data.startswith("sdays:"))
+async def cb_validity_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stuff = await get_stuff(callback.data.split(":", 1)[1])
+    if stuff is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    days = await features.get_stuff_days(stuff["_id"])
+    await state.set_state(AdminStates.set_days)
+    await state.update_data(stuff_id=str(stuff["_id"]))
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"⏱ <b>Access validity</b> for "
+        f"<b>{html.escape(stuff.get('name', '?'))}</b>\n\n"
+        f"Current: {_validity_label(days)}\n\n"
+        "Buyers get access for this many days after purchase.\n"
+        "Send the number of days (1–365), or <code>0</code> for forever:",
+        cancel_inline_kb(f"sadm:{stuff['_id']}"),
+    )
+
+
+@router.message(AdminStates.set_days, F.text)
+async def validity_set(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a whole number, e.g. 30 (or 0)")
+        return
+    if not 0 <= days <= 365:
+        await message.answer("Days must be between 0 and 365")
+        return
+    data = await state.get_data()
+    stuff_id = data.get("stuff_id")
+    await features.set_stuff_days(stuff_id, days)
+    await features.audit(f"Stuff {stuff_id} validity set to {_validity_label(days)}")
+    await state.clear()
+    stuff = await get_stuff(stuff_id)
+    if stuff is None:
+        await message.answer("Stuffs deleted.", reply_markup=panel_inline_kb())
+        return
+    await message.answer(
+        f"✅ Validity set to <b>{_validity_label(days)}</b>\n\n"
+        "Note: the Access validity feature must be ON for new purchases "
+        "to get a time limit.",
     )
     await _edit_or_send(
         message, await _stuff_view_text(stuff),

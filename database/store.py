@@ -172,7 +172,12 @@ async def ensure_user(tg_id: int, username: str | None, full_name: str | None) -
             {"tg_id": tg_id},
             {
                 "$set": {"username": username, "full_name": full_name},
-                "$setOnInsert": {"purchased": [], "balance": 0, "banned": False},
+                "$setOnInsert": {
+                    "purchased": [],
+                    "balance": 0,
+                    "banned": False,
+                    "expires": {},
+                },
             },
             upsert=True,
         )
@@ -184,6 +189,7 @@ async def ensure_user(tg_id: int, username: str | None, full_name: str | None) -
     if doc is not None:
         doc.setdefault("balance", 0)
         doc.setdefault("banned", False)
+        doc.setdefault("expires", {})
     return doc
 
 
@@ -199,6 +205,7 @@ async def find_user(tg_id: int) -> dict | None:
     if doc is not None:
         doc.setdefault("balance", 0)
         doc.setdefault("banned", False)
+        doc.setdefault("expires", {})
     return doc
 
 
@@ -224,6 +231,22 @@ async def grant_access(tg_id: int, stuff_id: str) -> None:
     from database import sqlite_backend
 
     await sqlite_backend.add_purchased(tg_id, key)
+
+
+async def set_purchase_expiry(tg_id: int, stuff_id, iso: str) -> None:
+    key = purchase_key(stuff_id)
+    if _mongo_mode:
+        from database import mongo
+
+        await mongo.users().update_one(
+            {"tg_id": tg_id},
+            {"$set": {f"expires.{key}": iso}},
+            upsert=True,
+        )
+        return
+    from database import sqlite_backend
+
+    await sqlite_backend.set_expiry_row(tg_id, key, iso)
 
 
 async def is_banned(tg_id: int) -> bool:
