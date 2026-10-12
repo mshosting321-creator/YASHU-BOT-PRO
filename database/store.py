@@ -177,6 +177,7 @@ async def ensure_user(tg_id: int, username: str | None, full_name: str | None) -
                     "balance": 0,
                     "banned": False,
                     "expires": {},
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             },
             upsert=True,
@@ -349,6 +350,115 @@ async def list_user_ids() -> list[int]:
     return await sqlite_backend.list_user_ids_row()
 
 
+async def list_user_ids_seen(bot_tag: str | None) -> list[int]:
+    if _mongo_mode:
+        from database import mongo
+
+        cursor = mongo.users().find(
+            {"last_seen_bot": bot_tag}, {"tg_id": 1}
+        )
+        docs = await cursor.to_list(length=100000)
+        return [int(d["tg_id"]) for d in docs]
+    from database import sqlite_backend
+
+    return await sqlite_backend.list_user_ids_seen_row(bot_tag)
+
+
+async def count_users_seen(bot_tag: str | None) -> int:
+    if _mongo_mode:
+        from database import mongo
+
+        return await mongo.users().count_documents({"last_seen_bot": bot_tag})
+    from database import sqlite_backend
+
+    return await sqlite_backend.count_users_seen_row(bot_tag)
+
+
+async def touch_user(tg_id: int, bot_tag: str | None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if _mongo_mode:
+        from database import mongo
+
+        await mongo.users().update_one(
+            {"tg_id": tg_id},
+            {"$set": {"last_seen_at": now, "last_seen_bot": bot_tag}},
+        )
+        return
+    from database import sqlite_backend
+
+    await sqlite_backend.touch_user_row(tg_id, bot_tag)
+
+
+async def count_users_created_after(iso: str) -> int:
+    if _mongo_mode:
+        from database import mongo
+
+        return await mongo.users().count_documents(
+            {"created_at": {"$gte": iso}}
+        )
+    from database import sqlite_backend
+
+    return await sqlite_backend.count_users_created_after_row(iso)
+
+
+async def search_users(query: str, limit: int = 5) -> list[dict]:
+    import re
+
+    query = (query or "").strip()
+    if not query:
+        return []
+    if _mongo_mode:
+        from database import mongo
+
+        rx = re.compile(re.escape(query), re.IGNORECASE)
+        if query.isdigit():
+            cond = {"$or": [{"tg_id": int(query)}, {"username": rx}, {"full_name": rx}]}
+        else:
+            cond = {"$or": [{"username": rx}, {"full_name": rx}]}
+        docs = await mongo.users().find(cond).limit(limit).to_list(length=limit)
+        for doc in docs:
+            doc.setdefault("balance", 0)
+            doc.setdefault("banned", False)
+            doc.setdefault("expires", {})
+        return docs
+    from database import sqlite_backend
+
+    return await sqlite_backend.search_users_row(query, limit)
+
+
+async def restore_collections(payload: dict) -> None:
+    """Replace mongo collections from a backup JSON payload."""
+    if not _mongo_mode:
+        raise RuntimeError("restore_collections is only for mongodb")
+    from database import mongo
+
+    mapping = {
+        "users": mongo.users,
+        "stuffs": mongo.stuffs,
+        "settings": mongo.settings,
+        "payment_methods": mongo.payment_methods,
+        "payment_requests": mongo.payment_requests,
+        "admins": mongo.admins,
+    }
+    for name, getter in mapping.items():
+        docs = payload.get(name)
+        if not isinstance(docs, list):
+            continue
+        cleaned = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            entry = {k: v for k, v in doc.items() if k != "_id"}
+            oid = doc.get("_id")
+            if oid is not None:
+                entry["_id"] = _oid(oid) or entry.get("_id")
+            cleaned.append(entry)
+        collection = getter()
+        await collection.delete_many({})
+        if cleaned:
+            await collection.insert_many(cleaned)
+
+
 async def list_requests() -> list[dict]:
     if _mongo_mode:
         from database import mongo
@@ -411,10 +521,23 @@ async def remove_admin(tg_id: int) -> None:
     await sqlite_backend.delete_admin_row(tg_id)
 
 
+async def set_admin_role(tg_id: int, role: str) -> None:
+    if _mongo_mode:
+        from database import mongo
+
+        await mongo.admins().update_one(
+            {"tg_id": tg_id}, {"$set": {"role": role}}
+        )
+        return
+    from database import sqlite_backend
+
+    await sqlite_backend.set_admin_role_row(tg_id, role)
+
+
 # ---------------------------------------------------------------- stuffs
 
 
-async def list_stuffs() -> list[dict]:
+async def list_stuffs(include_archived: bool = True) -> list[dict]:
     if _mongo_mode:
         from database import mongo
 
@@ -424,7 +547,15 @@ async def list_stuffs() -> list[dict]:
 
         rows = await sqlite_backend.list_stuffs()
     tag = current_tag()
-    return [s for s in rows if (s.get("bot") or "main") == tag]
+    scoped = [
+        s for s in rows
+        if (s.get("bot") or "main") == tag
+        and (include_archived or not s.get("archived"))
+    ]
+    scoped.sort(
+        key=lambda s: (0 if s.get("featured") else 1, (s.get("name") or "").lower())
+    )
+    return scoped
 
 
 async def get_stuff(stuff_id) -> dict | None:
@@ -567,6 +698,32 @@ async def set_stuff_category(stuff_id, category: str) -> None:
     from database import sqlite_backend
 
     await sqlite_backend.set_stuff_category(stuff_id, category)
+
+
+async def set_stuff_flags(
+    stuff_id, archived: bool | None = None, featured: bool | None = None
+) -> None:
+    update: dict = {}
+    if archived is not None:
+        update["archived"] = bool(archived)
+    if featured is not None:
+        update["featured"] = bool(featured)
+    if not update:
+        return
+    if _mongo_mode:
+        from database import mongo
+
+        await mongo.stuffs().update_one(
+            {"_id": _oid(stuff_id)}, {"$set": update}
+        )
+        return
+    from database import sqlite_backend
+
+    await sqlite_backend.set_stuff_flags_row(
+        stuff_id,
+        archived=update.get("archived"),
+        featured=update.get("featured"),
+    )
 
 
 async def delete_stuff(stuff_id) -> None:

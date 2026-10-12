@@ -216,38 +216,91 @@ def menu_button_kb() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------- admin
 
 
-def admin_stuffs_kb(stuffs: list[dict]) -> InlineKeyboardMarkup:
+def admin_stuffs_kb(
+    stuffs: list[dict],
+    bulk_mode: bool = False,
+    selected: set[str] | None = None,
+    show_bulk: bool = False,
+) -> InlineKeyboardMarkup:
+    selected = selected or set()
     rows = []
     for stuff in stuffs:
+        sid = str(stuff["_id"])
         price = stuff.get("price", 0)
         price_text = f"Rs.{int(price)}" if price > 0 else "free"
+        if bulk_mode:
+            mark = "[x]" if sid in selected else "[ ]"
+            label = f"{mark} {stuff['name']} — {price_text}"
+            rows.append([ib(label[:64], f"bsel:{sid}", "primary")])
+        else:
+            rows.append(
+                [ib(f"{stuff['name']} — {price_text}"[:64], f"sadm:{sid}", "primary")]
+            )
+    if bulk_mode:
         rows.append(
-            [ib(f"{stuff['name']} — {price_text}"[:64], f"sadm:{stuff['_id']}", "primary")]
+            [
+                ib("Set price", "sbprice", "primary"),
+                ib("Set category", "sbcat", "primary"),
+            ]
         )
-    rows.append([ib("Add stuff", "apnl:add", "success")])
+        rows.append(
+            [
+                ib("Archive", "sbarch", "primary"),
+                ib("Restore", "sbrst", "primary"),
+            ]
+        )
+        rows.append(
+            [
+                ib(f"Delete ({len(selected)})", "sbdel", "danger"),
+                ib("Done", "bscancel", "primary"),
+            ]
+        )
+    else:
+        rows.append([ib("Add stuff", "apnl:add", "success")])
+        if show_bulk and stuffs:
+            rows.append([ib("Bulk select", "bselm", "primary")])
     rows.append([ib("Panel", "aback", "primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_stuff_view_kb(stuff_id: str, lesson_count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def admin_stuff_view_kb(
+    stuff_id: str,
+    lesson_count: int,
+    show_ctrl: bool = False,
+    archived: bool = False,
+    featured: bool = False,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            ib("Add videos", f"saddl:{stuff_id}", "success"),
+            ib("Demo list", f"sadml:{stuff_id}", "primary"),
+        ],
+        [
+            ib("Rename", f"sren:{stuff_id}", "primary"),
+            ib("Price", f"sprice:{stuff_id}", "primary"),
+        ],
+        [
+            ib("Showcase", f"sshow:{stuff_id}", "primary"),
+            ib("Proofs", f"sproof:{stuff_id}", "primary"),
+        ],
+        [
+            ib("Category", f"scat:{stuff_id}", "primary"),
+            ib("Validity", f"sdays:{stuff_id}", "primary"),
+        ],
+    ]
+    if show_ctrl:
+        rows.append(
             [
-                ib("Add videos", f"saddl:{stuff_id}", "success"),
-                ib("Demo list", f"sadml:{stuff_id}", "primary"),
-            ],
-            [
-                ib("Rename", f"sren:{stuff_id}", "primary"),
-                ib("Price", f"sprice:{stuff_id}", "primary"),
-            ],
-            [
-                ib("Showcase", f"sshow:{stuff_id}", "primary"),
-                ib("Proofs", f"sproof:{stuff_id}", "primary"),
-            ],
-            [
-                ib("Category", f"scat:{stuff_id}", "primary"),
-                ib("Validity", f"sdays:{stuff_id}", "primary"),
-            ],
+                ib(
+                    "Restore" if archived else "Archive",
+                    f"sarch:{stuff_id}",
+                    "primary",
+                ),
+                ib("Unpin" if featured else "Pin", f"spin:{stuff_id}", "primary"),
+            ]
+        )
+    rows.extend(
+        [
             [
                 ib("Receive direct", f"sget:{stuff_id}", "success"),
                 ib("Download ZIP", f"szipdl:{stuff_id}", "success"),
@@ -259,6 +312,7 @@ def admin_stuff_view_kb(stuff_id: str, lesson_count: int) -> InlineKeyboardMarku
             [ib("Stuffs", "sadmin:stuffs", "primary")],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def clmode_kb() -> InlineKeyboardMarkup:
@@ -348,19 +402,51 @@ def add_photo_video_kb() -> InlineKeyboardMarkup:
     )
 
 
-def admins_kb(admins_list: list[dict], env_ids: set[int]) -> InlineKeyboardMarkup:
+def admins_kb(
+    admins_list: list[dict], env_ids: set[int], show_roles: bool = False
+) -> InlineKeyboardMarkup:
     rows = []
     seen: set[int] = set()
     for admin in admins_list:
         tg_id = admin.get("tg_id")
         seen.add(tg_id)
         label = f"@{admin['username']}" if admin.get("username") else str(tg_id)
-        rows.append([ib(f"Remove {label}"[:64], f"admdel:{tg_id}", "danger")])
+        if show_roles:
+            role = str(admin.get("role") or "full")
+            rows.append(
+                [
+                    ib(f"{label} [{role}]"[:64], f"admrole:{tg_id}", "primary"),
+                    ib("Remove", f"admdel:{tg_id}", "danger"),
+                ]
+            )
+        else:
+            rows.append([ib(f"Remove {label}"[:64], f"admdel:{tg_id}", "danger")])
     for tg_id in sorted(env_ids - seen):
-        rows.append([ib(f"Remove {tg_id} (env)", f"admdel:{tg_id}", "danger")])
+        if show_roles:
+            rows.append(
+                [
+                    ib(f"{tg_id} [env]", f"admrole:{tg_id}", "primary"),
+                    ib("Remove", f"admdel:{tg_id}", "danger"),
+                ]
+            )
+        else:
+            rows.append([ib(f"Remove {tg_id} (env)", f"admdel:{tg_id}", "danger")])
     rows.append([ib("Add admin", "admadd", "success")])
     rows.append([ib("Panel", "aback", "primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def role_kb(tg_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                ib("Full", f"admr:{tg_id}:full", "primary"),
+                ib("Support", f"admr:{tg_id}:support", "primary"),
+            ],
+            [ib("Content", f"admr:{tg_id}:content", "primary")],
+            [ib("Back", "apnl:admins", "primary")],
+        ]
+    )
 
 
 def kind_crypto_kb() -> InlineKeyboardMarkup:
@@ -441,51 +527,52 @@ def approve_open_kb(stuff_id: str | None) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------- panel / flows
 
 
-def panel_inline_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [ib("Add stuff", "apnl:add", "success")],
-            [
-                ib("Stuffs", "apnl:stuffs", "primary"),
-                ib("Start message", "apnl:startmsg", "primary"),
-            ],
-            [
-                ib("Admins", "apnl:admins", "primary"),
-                ib("Payment methods", "apnl:methods", "primary"),
-            ],
-            [
-                ib("Protection", "apnl:protect", "primary"),
-                ib("Log group", "apnl:loggroup", "primary"),
-            ],
-            [
-                ib("Users", "apnl:users", "primary"),
-                ib("Broadcast", "apnl:bcast", "primary"),
-            ],
-            [
-                ib("Stats", "apnl:stats", "primary"),
-                ib("VPS", "apnl:vps", "primary"),
-            ],
-            [ib("Clone bots", "apnl:clones", "success")],
-            [ib("Features", "apnl:features", "success")],
-            [
-                ib("Coupons", "apnl:coupons", "primary"),
-                ib("Gift codes", "apnl:gifts", "primary"),
-            ],
-            [
-                ib("Reviews", "apnl:reviews", "primary"),
-                ib("Support", "apnl:support", "primary"),
-            ],
-            [
-                ib("Schedule", "apnl:sched", "primary"),
-                ib("FAQ", "apnl:faq", "primary"),
-            ],
-            [ib("Audit log", "apnl:audit", "primary")],
-            [
-                ib("Help text", "apnl:helptext", "primary"),
-                ib("Menu", "smenu", "primary"),
-            ],
-        ]
-    )
+_PANEL_ITEMS: list[tuple[str, str, str, str]] = [
+    ("Dashboard", "apnl:dash", "success", "all"),
+    ("Pending", "apnl:pending", "primary", "full"),
+    ("Add stuff", "apnl:add", "success", "full,content"),
+    ("Stuffs", "apnl:stuffs", "primary", "full,content"),
+    ("Start message", "apnl:startmsg", "primary", "full,content"),
+    ("Help text", "apnl:helptext", "primary", "full,content"),
+    ("Admins", "apnl:admins", "primary", "full"),
+    ("Payment methods", "apnl:methods", "primary", "full"),
+    ("Users", "apnl:users", "primary", "full,support"),
+    ("Broadcast", "apnl:bcast", "primary", "full"),
+    ("Search", "apnl:search", "primary", "all"),
+    ("Stats", "apnl:stats", "primary", "full"),
+    ("VPS", "apnl:vps", "primary", "full"),
+    ("Clone bots", "apnl:clones", "success", "full"),
+    ("Features", "apnl:features", "success", "full"),
+    ("Coupons", "apnl:coupons", "primary", "full"),
+    ("Gift codes", "apnl:gifts", "primary", "full"),
+    ("Reviews", "apnl:reviews", "primary", "full,content"),
+    ("Support", "apnl:support", "primary", "full,support"),
+    ("Schedule", "apnl:sched", "primary", "full"),
+    ("Timers", "apnl:timers", "primary", "full"),
+    ("Media library", "apnl:media", "primary", "full,content"),
+    ("Analytics", "apnl:analytics", "primary", "full"),
+    ("Backup", "apnl:backup", "primary", "full"),
+    ("Protection", "apnl:protect", "primary", "full"),
+    ("Log group", "apnl:loggroup", "primary", "full"),
+    ("FAQ", "apnl:faq", "primary", "full"),
+    ("Audit log", "apnl:audit", "primary", "full,support"),
+    ("Menu", "smenu", "primary", "all"),
+]
+
+
+def panel_inline_kb(role: str = "full") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    bucket: list[InlineKeyboardButton] = []
+    for label, cb, style, roles in _PANEL_ITEMS:
+        if roles != "all" and role not in roles.split(","):
+            continue
+        bucket.append(ib(label, cb, style))
+        if len(bucket) == 2:
+            rows.append(bucket)
+            bucket = []
+    if bucket:
+        rows.append(bucket)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def add_stuff_choice_kb() -> InlineKeyboardMarkup:
@@ -654,6 +741,7 @@ def features_kb(
             ib("Auto-approve max", "featcfg:autoapp", "primary"),
         ]
     )
+    rows.append([ib("Big-sale alert", "featcfg:alert", "primary")])
     view_row = []
     if show_leaderboard:
         view_row.append(ib("Leaderboard", "featlb", "primary"))
@@ -731,11 +819,12 @@ def reviews_kb(reviews: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def support_kb(tickets: list[dict]) -> InlineKeyboardMarkup:
+def support_kb(tickets: list[dict], canned: list[str] | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for ticket in tickets[:12]:
         status = "open" if ticket.get("status") == "open" else "done"
-        label = f"{ticket.get('user_name', '?')} ({status})"[:64]
+        prio = str(ticket.get("_prio") or "")
+        label = f"{ticket.get('user_name', '?')} ({status}){prio}"[:64]
         rows.append(
             [
                 ib(label, f"tview:{ticket['id']}", "primary"),
@@ -745,6 +834,14 @@ def support_kb(tickets: list[dict]) -> InlineKeyboardMarkup:
         )
     if not tickets:
         rows.append([ib("No tickets", "tnone", "primary")])
+    for index, item in enumerate((canned or [])[:8]):
+        rows.append(
+            [
+                ib(f"Canned {index + 1}: {item[:38]}"[:64], f"cannone:{index}", "primary"),
+                ib("Del", f"candel:{index}", "danger"),
+            ]
+        )
+    rows.append([ib("Add canned reply", "canadd", "success")])
     rows.append([ib("Panel", "aback", "primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

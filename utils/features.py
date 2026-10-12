@@ -43,6 +43,22 @@ FEATURES: dict[str, tuple[str, str]] = {
     "antiflood": ("Anti-flood", "Warn users who send messages too fast"),
     "stale_reject": ("Auto-reject old claims", "Expire pending claims after 48 hours"),
     "expiry": ("Access validity", "Limit purchases to N days per stuff"),
+    "dash": ("Dashboard", "KPI dashboard with a live activity feed"),
+    "pending": ("Pending inbox", "Review payment claims from a quick inbox"),
+    "analytics": ("Analytics", "Funnel, revenue and coupon reports"),
+    "psearch": ("Global search", "Search users, orders and coupons from the panel"),
+    "offer": ("Offer timers", "Schedule feature toggles and price changes"),
+    "segments": ("Segment broadcast", "Send to buyers, non-buyers or a stuff's buyers"),
+    "sla": ("Support priority", "Ticket age priority and quick canned replies"),
+    "alerts": ("Admin alerts", "DM alerts for big sales and new tickets"),
+    "medialib": ("Media library", "Reusable videos and photos for lessons"),
+    "bulk": ("Bulk ops", "Bulk price, category, archive and delete"),
+    "stuffctrl": ("Stuffs controls", "Archive, restore and pin stuffs"),
+    "backup": ("Backup and restore", "Manual backup plus one-tap restore"),
+    "roles": ("Admin roles", "Full, support and content admin roles"),
+    "crm": ("Customer timeline", "Notes, tags and order history per user"),
+    "dconfirm": ("Danger confirm", "Extra confirm step before destructive actions"),
+    "clonedash": ("Clone dashboard", "Per-bot stats, earnings and broadcasts"),
 }
 DEFAULT_OFF = {"maintenance", "autoapprove", "antiflood", "stale_reject"}
 FLAGS_KEY = "feature_flags"
@@ -53,6 +69,9 @@ FAQ_KEY = "faq_pairs"
 TICKETS_KEY = "tickets"
 SCHEDULE_KEY = "schedule"
 AUDIT_KEY = "audit_log"
+TIMERS_KEY = "offer_timers"
+CANNED_KEY = "canned_replies"
+MEDIALIB_KEY = "media_lib"
 
 
 async def flags() -> dict[str, bool]:
@@ -805,3 +824,244 @@ def expiry_line(user: dict | None, stuff: dict) -> str | None:
     else:
         span = f"{max(1, int(left.seconds // 3600))}h left"
     return f"Access valid until {until:%d %b %Y} ({span})"
+
+
+# ------------------------------------------------------------------ timers
+
+
+async def get_timers() -> list[dict]:
+    data = await load_json(TIMERS_KEY, [])
+    return data if isinstance(data, list) else []
+
+
+async def save_timers(entries: list[dict]) -> None:
+    await save_json(TIMERS_KEY, entries)
+
+
+async def add_timer(
+    kind: str,
+    target,
+    value,
+    at_iso: str,
+    note: str = "",
+    tag: str = "main",
+) -> dict:
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "kind": kind,
+        "target": str(target),
+        "value": value,
+        "at": at_iso,
+        "note": note,
+        "tag": tag,
+    }
+    entries = await get_timers()
+    entries.append(entry)
+    await save_timers(entries)
+    return entry
+
+
+async def drop_timer(timer_id: str) -> None:
+    entries = [t for t in await get_timers() if str(t.get("id")) != str(timer_id)]
+    await save_timers(entries)
+
+
+def due_timers(entries: list[dict], now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now(timezone.utc)
+    due = []
+    for entry in entries:
+        moment = _iso(entry.get("at"))
+        if moment is None:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        if moment <= now:
+            due.append(entry)
+    due.sort(key=lambda e: str(e.get("at", "")))
+    return due
+
+
+def timer_line(entry: dict) -> str:
+    moment = _iso(entry.get("at"))
+    when = moment.strftime("%d %b %H:%M UTC") if moment else "?"
+    if entry.get("kind") == "feature":
+        target = entry.get("target")
+        label = FEATURES.get(str(target), (str(target), ""))[0]
+        value = "ON" if entry.get("value") else "OFF"
+        what = f"{label} -> {value}"
+    else:
+        what = f"Stuff {entry.get('target')} price -> Rs.{entry.get('value')}"
+    note = str(entry.get("note") or "")
+    suffix = f" ({note})" if note else ""
+    return f"{when}: {what}{suffix}"
+
+
+# ---------------------------------------------------------------- segments
+
+
+async def segment_ids(kind: str, stuff_id=None) -> list[int]:
+    """User ids for a broadcast segment, scoped to the current bot tag."""
+    from database.store import list_requests, list_user_ids
+
+    ids = set(await list_user_ids())
+    if kind == "all":
+        return sorted(ids)
+    buyers: set[int] = set()
+    stuff_buyers: set[int] = set()
+    for request in await list_requests():
+        if str(request.get("status")) != "approved":
+            continue
+        try:
+            uid = int(request.get("user_tg_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not uid:
+            continue
+        buyers.add(uid)
+        raw = str(request.get("stuff_id") or "")
+        parts = {p.strip() for p in raw.split(",") if p.strip()}
+        if stuff_id is not None and str(stuff_id) in parts:
+            stuff_buyers.add(uid)
+    if kind == "buyers":
+        return sorted(ids & buyers)
+    if kind == "nonbuyers":
+        return sorted(ids - buyers)
+    if kind == "stuffbuyers":
+        return sorted(ids & stuff_buyers)
+    return sorted(ids)
+
+
+# ----------------------------------------------------------------- alerts
+
+
+async def get_alert_min() -> float:
+    raw = await get_setting("alert_min", "500")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 500.0
+
+
+async def set_alert_min(value: float) -> None:
+    await set_setting("alert_min", f"{value:g}")
+
+
+async def alert_admins(bot, text: str) -> None:
+    """DM every panel admin (feature: alerts). Never raises."""
+    try:
+        if not await is_on("alerts"):
+            return
+    except Exception:
+        return
+    from database.store import list_admins
+
+    try:
+        admins = await list_admins()
+    except Exception:
+        admins = []
+    ids = []
+    for admin in admins:
+        try:
+            uid = int(admin.get("tg_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if uid and uid not in ids:
+            ids.append(uid)
+    if not ids:
+        return
+    for uid in ids:
+        try:
+            await bot.send_message(uid, text)
+        except Exception:
+            continue
+
+
+async def sale_alert(bot, amount, user_name: str, item: str) -> None:
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return
+    threshold = await get_alert_min()
+    if threshold <= 0 or value < threshold:
+        return
+    await alert_admins(
+        bot,
+        f"Big sale: Rs.{value:g} from {user_name}\nItem: {item}",
+    )
+
+
+# ------------------------------------------------------------ canned replies
+
+
+async def get_canned() -> list[str]:
+    data = await load_json(CANNED_KEY, [])
+    if isinstance(data, list):
+        return [str(x) for x in data if str(x).strip()]
+    return []
+
+
+async def save_canned(items: list[str]) -> None:
+    await save_json(CANNED_KEY, [str(x) for x in items if str(x).strip()][:50])
+
+
+# ------------------------------------------------------------ customer notes
+
+
+async def get_note(tg_id: int) -> str:
+    return await get_setting(f"note_{tg_id}", "")
+
+
+async def set_note(tg_id: int, text: str) -> None:
+    await set_setting(f"note_{tg_id}", (text or "")[:500])
+
+
+async def get_tags(tg_id: int) -> list[str]:
+    data = await load_json(f"tags_{tg_id}", [])
+    return [str(x) for x in data] if isinstance(data, list) else []
+
+
+async def set_tags(tg_id: int, tags: list[str]) -> None:
+    await save_json(f"tags_{tg_id}", [str(t)[:24] for t in tags][:10])
+
+
+async def toggle_tag(tg_id: int, tag: str) -> bool:
+    tags = await get_tags(tg_id)
+    if tag in tags:
+        tags.remove(tag)
+        added = False
+    else:
+        tags.append(tag)
+        added = True
+    await set_tags(tg_id, tags)
+    return added
+
+
+# --------------------------------------------------------------- media lib
+
+
+async def get_media() -> list[dict]:
+    data = await load_json(MEDIALIB_KEY, [])
+    return data if isinstance(data, list) else []
+
+
+async def save_media(items: list[dict]) -> None:
+    await save_json(MEDIALIB_KEY, items[:100])
+
+
+async def add_media(name: str, kind: str, file_id: str) -> dict:
+    items = await get_media()
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "name": (name or kind).strip()[:60],
+        "kind": kind,
+        "file_id": file_id,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    items.append(entry)
+    await save_media(items)
+    return entry
+
+
+async def drop_media(media_id: str) -> None:
+    items = [m for m in await get_media() if str(m.get("id")) != str(media_id)]
+    await save_media(items)

@@ -59,12 +59,53 @@ async def _tick(bot) -> None:
     local = now.astimezone()
     if await features.is_on("scheduler"):
         await _run_due_bcasts(bot)
+    if await features.is_on("offer"):
+        await _run_due_timers()
     if await features.is_on("stale_reject"):
         await _reject_stale(bot, now)
     if await features.is_on("autobackup"):
         await _maybe_fire("backup", await features.get_backup_time(), local, _backup, bot)
     if await features.is_on("dailyreport"):
         await _maybe_fire("report", await features.get_report_time(), local, _report, bot)
+
+
+async def _run_due_timers() -> None:
+    entries = await features.get_timers()
+    if not entries:
+        return
+    due = features.due_timers(entries)
+    if not due:
+        return
+    done_ids: set[str] = set()
+    for entry in due:
+        try:
+            await _apply_timer(entry)
+        except Exception:
+            logger.exception("offer timer failed")
+        done_ids.add(str(entry.get("id")))
+    remaining = [t for t in entries if str(t.get("id")) not in done_ids]
+    await features.save_timers(remaining)
+    await features.audit(f"Executed {len(done_ids)} offer timer(s)")
+
+
+async def _apply_timer(entry: dict) -> None:
+    from database.scoping import as_tag
+
+    tag = str(entry.get("tag") or "main")
+    with as_tag(tag):
+        if entry.get("kind") == "feature":
+            key = str(entry.get("target"))
+            await features.set_flag(key, bool(entry.get("value")))
+            state = "ON" if entry.get("value") else "OFF"
+            await features.audit(f"Timer ({tag}): {key} -> {state}")
+        elif entry.get("kind") == "price":
+            from database.store import set_stuff_price
+
+            value = float(entry.get("value") or 0)
+            await set_stuff_price(entry.get("target"), value)
+            await features.audit(
+                f"Timer ({tag}): stuff {entry.get('target')} price -> Rs.{value:g}"
+            )
 
 
 async def _reject_stale(bot, now: datetime) -> None:

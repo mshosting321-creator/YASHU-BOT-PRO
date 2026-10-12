@@ -50,6 +50,16 @@ class AdminStates(StatesGroup):
     set_days = State()
     cfg_cashback = State()
     cfg_autoapprove = State()
+    timer_price = State()
+    timer_time = State()
+    media_add = State()
+    user_note = State()
+    restore_file = State()
+    search_q = State()
+    bulk_price = State()
+    bulk_cat = State()
+    cfg_alert = State()
+    canned_add = State()
 
 
 class PaymentStates(StatesGroup):

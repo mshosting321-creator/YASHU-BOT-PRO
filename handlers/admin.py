@@ -2,9 +2,10 @@ import asyncio
 import csv
 import html
 import io
+import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Bot, Router
 from aiogram.exceptions import TelegramAPIError
@@ -14,16 +15,20 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     FSInputFile,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
 )
-from config import ADMIN_IDS, AUTH_ADMIN_IDS, MAX_ZIP_SIZE, MEDIA_TEMP_DIR
+from config import ADMIN_IDS, AUTH_ADMIN_IDS, DATABASE_URL, MAX_ZIP_SIZE, MEDIA_TEMP_DIR
+from database.scoping import as_tag
 from database.store import (
     DuplicateKeyError,
     add_balance,
     append_lessons,
     count_users,
+    count_users_created_after,
+    count_users_seen,
     create_stuff,
     delete_method,
     delete_stuff,
@@ -35,13 +40,17 @@ from database.store import (
     list_stuffs,
     list_requests,
     list_user_ids,
+    list_user_ids_seen,
     rename_stuff,
+    search_users,
+    set_admin_role,
     set_banned,
     set_lesson_demo,
     set_proofs,
     set_setting,
     set_showcase,
     set_stuff_category,
+    set_stuff_flags,
     set_stuff_price,
     update_method,
 )
@@ -72,6 +81,7 @@ from keyboards.inline import (
     proofs_kb,
     protect_kb,
     reviews_kb,
+    role_kb,
     schedule_kb,
     showcase_kb,
     start_msg_kb,
@@ -81,7 +91,7 @@ from states.admin_states import AdminStates
 from utils import clones as clone_manager
 from utils import features
 from utils.export import build_stuff_zip, cleanup_export, send_stuff_direct
-from utils.monitoring import stats_text, vps_text
+from utils.monitoring import stats_text, vps_text, _graph_text
 from utils.payments import (
     build_transaction_text,
     deliver_stuff,
@@ -178,14 +188,32 @@ def _validity_label(days: int) -> str:
     return f"{days} day(s)"
 
 
+async def _stuff_kb_for(doc: dict | None) -> InlineKeyboardMarkup:
+    doc = doc or {}
+    return admin_stuff_view_kb(
+        str(doc.get("_id", "")),
+        len(doc.get("lessons") or []),
+        show_ctrl=await features.is_on("stuffctrl"),
+        archived=bool(doc.get("archived")),
+        featured=bool(doc.get("featured")),
+    )
+
+
 async def _stuff_view_text(stuff: dict) -> str:
     price = stuff.get("price", 0)
-    price_text = f"{int(price)} ⭐" if price > 0 else "free"
+    price_text = f"{int(price)} ₹" if price > 0 else "free"
     lessons = stuff.get("lessons", [])
     demo_count = sum(1 for lesson in lessons if lesson.get("is_demo"))
+    badges = []
+    if stuff.get("archived"):
+        badges.append("ARCHIVED")
+    if stuff.get("featured"):
+        badges.append("PINNED")
+    badge_line = ("[" + ", ".join(badges) + "]\n") if badges else ""
     text = (
-        f"<b>{html.escape(stuff.get('name', '?'))}</b>\n\n"
-        f"Price: {price_text}\n"
+        f"<b>{html.escape(stuff.get('name', '?'))}</b>\n"
+        f"{badge_line}"
+        f"\nPrice: {price_text}\n"
         f"Category: {html.escape(stuff.get('category') or '—')}\n"
         f"Validity: {_validity_label(await features.get_stuff_days(stuff['_id']))}\n"
         f"Stuffs: {len(lessons)} (demo: {demo_count})\n"
@@ -273,12 +301,61 @@ def _log_group_prompt() -> str:
     )
 
 
+async def _role_of(tg_id: int) -> str:
+    if tg_id in AUTH_ADMIN_IDS:
+        return "full"
+    for admin in await get_admin_list():
+        try:
+            if int(admin.get("tg_id") or 0) == tg_id:
+                return str(admin.get("role") or "full")
+        except (TypeError, ValueError):
+            continue
+    return "full"
+
+
+def _role_ok(role: str, allowed: str) -> bool:
+    if allowed == "all" or role == "full":
+        return True
+    return role in allowed.split(",")
+
+
+_BRANCH_ROLES = {
+    "add": "full,content",
+    "stuffs": "full,content",
+    "startmsg": "full,content",
+    "helptext": "full,content",
+    "reviews": "full,content",
+    "media": "full,content",
+    "support": "full,support",
+    "audit": "full,support",
+    "users": "full,support",
+    "dash": "all",
+    "search": "all",
+}
+
+
+def _off_notice(label: str) -> str:
+    return (
+        "⚠️ <b>Feature turned off</b>\n\n"
+        f"{label} is disabled. Enable it on the Features page."
+    )
+
+
+def _back_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[ib("Panel", "aback", "primary")]])
+
+
+async def _show_dashboard(target: Message) -> None:
+    await _edit_or_send(target, await _dashboard_text(), _dashboard_kb())
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     if not await is_admin(message.from_user.id):
         return
     await state.clear()
-    await message.answer(panel_text(), reply_markup=panel_inline_kb())
+    role = await _role_of(message.from_user.id)
+    await message.answer(panel_text(), reply_markup=panel_inline_kb(role))
 
 
 @router.message(F.text == "❌ Cancel", F.from_user.id.in_(AUTH_ADMIN_IDS))
@@ -303,7 +380,58 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     target = callback.message
 
-    if key == "zip":
+    role = await _role_of(callback.from_user.id)
+    allowed = _BRANCH_ROLES.get(key, "full")
+    if not _role_ok(role, allowed):
+        await _edit_or_send(
+            target,
+            "⛔ Your admin role does not include this section.",
+            _back_panel_kb(),
+        )
+        return
+
+    if key == "dash":
+        if await features.is_on("dash"):
+            await _show_dashboard(target)
+        else:
+            await _edit_or_send(target, _off_notice("Dashboard"), _back_panel_kb())
+    elif key == "pending":
+        if await features.is_on("pending"):
+            await _show_pending(target)
+        else:
+            await _edit_or_send(target, _off_notice("Pending inbox"), _back_panel_kb())
+    elif key == "analytics":
+        if await features.is_on("analytics"):
+            await _show_analytics(target)
+        else:
+            await _edit_or_send(target, _off_notice("Analytics"), _back_panel_kb())
+    elif key == "search":
+        if await features.is_on("psearch"):
+            await state.set_state(AdminStates.search_q)
+            await _edit_or_send(
+                target,
+                "🔍 <b>Panel search</b>\n\n"
+                "Send a name, username, user ID, order ID or coupon code:",
+                cancel_inline_kb("aback"),
+            )
+        else:
+            await _edit_or_send(target, _off_notice("Global search"), _back_panel_kb())
+    elif key == "timers":
+        if await features.is_on("offer"):
+            await _show_timers(target)
+        else:
+            await _edit_or_send(target, _off_notice("Offer timers"), _back_panel_kb())
+    elif key == "media":
+        if await features.is_on("medialib"):
+            await _show_media(target)
+        else:
+            await _edit_or_send(target, _off_notice("Media library"), _back_panel_kb())
+    elif key == "backup":
+        if await features.is_on("backup"):
+            await _show_backup(target)
+        else:
+            await _edit_or_send(target, _off_notice("Backup"), _back_panel_kb())
+    elif key == "zip":
         await state.set_state(AdminStates.waiting_zip)
         await _edit_or_send(target, ZIP_INSTRUCTIONS, cancel_inline_kb("scancel"))
     elif key == "direct":
@@ -316,13 +444,7 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
             add_stuff_choice_kb(),
         )
     elif key == "stuffs":
-        items = await list_stuffs()
-        text = (
-            "🗂 <b>Stuffs</b>\n\nTap a stuff to manage it."
-            if items
-            else "🗂 <b>Stuffs</b>\n\nNo stuffs yet."
-        )
-        await _edit_or_send(target, text, admin_stuffs_kb(items))
+        await _show_stuffs_list(target, state)
     elif key == "startmsg":
         start = await get_start_message()
         await _edit_or_send(
@@ -334,7 +456,11 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
         )
     elif key == "admins":
         items = await get_admin_list()
-        await _edit_or_send(target, ADMINS_TEXT, admins_kb_view(items))
+        await _edit_or_send(
+            target,
+            ADMINS_TEXT,
+            admins_kb_view(items, show_roles=await features.is_on("roles")),
+        )
     elif key == "methods":
         await ensure_default_methods()
         methods = await get_all_methods()
@@ -363,8 +489,10 @@ async def cb_panel_action(callback: CallbackQuery, state: FSMContext) -> None:
         await _edit_or_send(
             target,
             "📣 <b>Broadcast</b>\n\n"
-            "Send the message text (HTML is supported).\n"
-            "You will see a preview and confirm before sending.",
+            "Send the message: <b>text, photo, video, GIF or sticker</b> "
+            "(caption becomes the text; stickers go as-is).\n"
+            "Next you pick the audience (everyone, buyers, non-buyers, "
+            "or a stuff's buyers) and confirm a preview.",
             cancel_inline_kb("aback"),
         )
     elif key == "stats":
@@ -437,7 +565,10 @@ async def _show_clones(target: Message) -> None:
         "from this bot.\n"
         "New database = the clone starts empty.\n\n"
     )
-    await _edit_or_send(target, f"🤖 <b>Clone bots</b>\n\n{mode_text}", clones_kb(entries, running))
+    text = f"🤖 <b>Clone bots</b>\n\n{mode_text}"
+    if entries and await features.is_on("clonedash"):
+        text += await _clone_network_text(entries, running)
+    await _edit_or_send(target, text, clones_kb(entries, running))
 
 
 @router.message(Command("clone"))
@@ -560,14 +691,22 @@ async def cb_clone_info(callback: CallbackQuery) -> None:
     tag = callback.data.split(":", 1)[1]
     entries = await clone_manager.load_registry()
     entry = next((e for e in entries if e.get("tag") == tag), None)
-    if not entry:
+    if entry is None:
         await callback.answer("Clone not found", show_alert=True)
         return
-    status = "running" if clone_manager.is_running(tag) else "stopped"
-    mode = "same clone (copied)" if entry.get("mode") == "copy" else "new database"
-    await callback.answer(
-        f"@{entry.get('username') or tag} - {mode} - {status}",
-        show_alert=True,
+    if not await features.is_on("clonedash"):
+        status = "running" if clone_manager.is_running(tag) else "stopped"
+        mode = "same clone (copied)" if entry.get("mode") == "copy" else "new database"
+        await callback.answer(
+            f"@{entry.get('username') or tag} - {mode} - {status}",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        await _clone_stats_text(entry),
+        _clone_dash_kb(tag),
     )
 
 
@@ -589,6 +728,23 @@ async def cb_clone_delete(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     tag = callback.data.split(":", 1)[1]
+    if await features.is_on("dconfirm"):
+        await callback.answer()
+        await _edit_or_send(
+            callback.message,
+            f"⚠️ <b>Remove clone {html.escape(tag)}?</b>\n\n"
+            "The clone bot stops and its registry entry is deleted. "
+            "Database data stays.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        ib("Remove", f"cldelok:{tag}", "danger"),
+                        ib("Back", "apnl:clones", "primary"),
+                    ]
+                ]
+            ),
+        )
+        return
     await clone_manager.remove_clone(tag)
     await features.audit(f"Clone removed: {tag}")
     await callback.answer("Clone removed")
@@ -1162,14 +1318,12 @@ async def cb_stuff_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data == "sadmin:stuffs")
-async def cb_stuffs_list(callback: CallbackQuery) -> None:
+async def cb_stuffs_list(callback: CallbackQuery, state: FSMContext) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
         return
-    items = await list_stuffs()
-    text = "🗂 <b>Stuffs</b>\n\nTap a stuff to manage it." if items else "🗂 <b>Stuffs</b>\n\nNo stuffs yet."
     await callback.answer()
-    await _edit_or_send(callback.message, text, admin_stuffs_kb(items))
+    await _show_stuffs_list(callback.message, state)
 
 
 @router.callback_query(F.data.startswith("sadm:"))
@@ -1186,7 +1340,7 @@ async def cb_stuff_admin_view(callback: CallbackQuery) -> None:
     await _edit_or_send(
         callback.message,
         await _stuff_view_text(doc),
-        admin_stuff_view_kb(stuff_id, len(doc.get("lessons", []))),
+        await _stuff_kb_for(doc),
     )
 
 
@@ -1255,7 +1409,7 @@ async def cb_add_lessons_done(callback: CallbackQuery, state: FSMContext) -> Non
     await _edit_or_send(
         callback.message,
         await _stuff_view_text(doc or {"name": "?", "price": 0, "lessons": []}),
-        admin_stuff_view_kb(stuff_id, len((doc or {}).get("lessons", []))),
+        await _stuff_kb_for(doc or {}),
     )
 
 
@@ -1342,7 +1496,7 @@ async def do_rename(message: Message, state: FSMContext) -> None:
     if doc:
         await message.answer(
             await _stuff_view_text(doc),
-            reply_markup=admin_stuff_view_kb(data["stuff_id"], len(doc.get("lessons", []))),
+            reply_markup=await _stuff_kb_for(doc),
         )
 
 
@@ -1382,7 +1536,7 @@ async def do_price(message: Message, state: FSMContext) -> None:
     if doc:
         await message.answer(
             await _stuff_view_text(doc),
-            reply_markup=admin_stuff_view_kb(data["stuff_id"], len(doc.get("lessons", []))),
+            reply_markup=await _stuff_kb_for(doc),
         )
 
 
@@ -1579,8 +1733,8 @@ async def cb_preview_start(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------- admins
 
 
-def admins_kb_view(items: list[dict]):
-    return admins_kb(items, ADMIN_IDS)
+def admins_kb_view(items: list[dict], show_roles: bool = False):
+    return admins_kb(items, ADMIN_IDS, show_roles=show_roles)
 
 
 @router.callback_query(F.data == "admadd")
@@ -2055,6 +2209,9 @@ async def cb_approve(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
         return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only a full admin can approve payments", show_alert=True)
+        return
     request_id = callback.data.split(":", 1)[1]
     request = await get_payment_request(request_id)
     if request is None:
@@ -2074,6 +2231,12 @@ async def cb_approve(callback: CallbackQuery) -> None:
     await set_request_status(request_id, "approved")
     await features.audit(
         f"Payment approved: Rs.{request.get('amount', '?')} from {request.get('user_tg_id')}"
+    )
+    await features.sale_alert(
+        callback.bot,
+        float(request.get("amount") or 0),
+        str(request.get("user_username") or request.get("user_tg_id")),
+        str(request.get("stuff_name") or "stuff"),
     )
     await notify_log_group(
         callback.bot,
@@ -2143,6 +2306,9 @@ async def cb_approve(callback: CallbackQuery) -> None:
 async def cb_reject(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
+        return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only a full admin can reject payments", show_alert=True)
         return
     request_id = callback.data.split(":", 1)[1]
     request = await get_payment_request(request_id)
@@ -2215,25 +2381,70 @@ def _user_card_text(user: dict, tg_id: int, admin_user: bool) -> str:
     )
 
 
-def _user_card_kb(tg_id: int, banned: bool) -> InlineKeyboardMarkup:
+def _user_card_text_crm(user: dict, base: str, note: str, tags: list[str], history: list[dict]) -> str:
+    tag_line = ", ".join(f"#{t}" for t in tags) if tags else "(none)"
+    lines = [
+        base,
+        "──────────────────────",
+        f"🏷 Tags: <b>{html.escape(tag_line)}</b>",
+        f"📝 Note: {html.escape(note) if note else '(empty)'}",
+    ]
+    if history:
+        lines.append("<b>Recent orders</b>")
+        for row in history[:3]:
+            moment = _event_time(row.get("created_at"))
+            when = f"{moment:%d %b}" if moment else "?"
+            lines.append(
+                f"• {when} Rs.{float(row.get('amount', 0) or 0):g} — "
+                f"{html.escape(str(row.get('stuff_name') or '?'))[:28]} "
+                f"[{row.get('status')}]"
+            )
+    else:
+        lines.append("Recent orders: none")
+    return "\n".join(lines)
+
+
+def _user_card_kb(
+    tg_id: int,
+    banned: bool,
+    show_crm: bool = False,
+    tags: list[str] | None = None,
+) -> InlineKeyboardMarkup:
     ban_row = (
         ib("Unban", f"uunban:{tg_id}", "success")
         if banned
         else ib("Ban", f"uban:{tg_id}", "danger")
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [ban_row],
+    rows: list[list[InlineKeyboardButton]] = [
+        [ban_row],
+        [
+            ib("Add balance", f"ubal:{tg_id}", "primary"),
+            ib("Remove balance", f"ubalrm:{tg_id}", "primary"),
+        ],
+    ]
+    if show_crm:
+        rows.append(
             [
-                ib("Add balance", f"ubal:{tg_id}", "primary"),
-                ib("Remove balance", f"ubalrm:{tg_id}", "primary"),
-            ],
+                ib("Note", f"unote:{tg_id}", "primary"),
+                ib("Refresh", f"ucard:{tg_id}", "primary"),
+            ]
+        )
+        tag_set = set(tags or [])
+        rows.append(
+            [
+                ib(f"VIP [{'on' if 'VIP' in tag_set else 'off'}]", f"utag:{tg_id}:VIP", "primary"),
+                ib(f"Watch [{'on' if 'Watch' in tag_set else 'off'}]", f"utag:{tg_id}:Watch", "primary"),
+            ]
+        )
+        rows.append([ib("Back", "umgrback", "primary")])
+    else:
+        rows.append(
             [
                 ib("Refresh", f"ucard:{tg_id}", "primary"),
                 ib("Back", "umgrback", "primary"),
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _show_user_card(target: Message, tg_id: int) -> None:
@@ -2245,10 +2456,20 @@ async def _show_user_card(target: Message, tg_id: int) -> None:
     admin_user = tg_id in ADMIN_IDS or any(
         a.get("tg_id") == tg_id for a in await get_admin_list()
     )
+    crm = await features.is_on("crm")
+    base = _user_card_text(user, tg_id, admin_user)
+    if crm:
+        note = await features.get_note(tg_id)
+        tags = await features.get_tags(tg_id)
+        history = await features.purchase_history(tg_id, 3)
+        text = _user_card_text_crm(user, base, note, tags, history)
+    else:
+        tags = []
+        text = base
     await _edit_or_send(
         target,
-        _user_card_text(user, tg_id, admin_user),
-        _user_card_kb(tg_id, bool(user.get("banned"))),
+        text,
+        _user_card_kb(tg_id, bool(user.get("banned")), show_crm=crm, tags=tags),
     )
 
 
@@ -2284,6 +2505,9 @@ async def cb_user_ban(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
         return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only a full admin can ban users", show_alert=True)
+        return
     try:
         tg_id = int(callback.data.split(":", 1)[1])
     except ValueError:
@@ -2302,6 +2526,9 @@ async def cb_user_ban(callback: CallbackQuery) -> None:
 async def cb_user_unban(callback: CallbackQuery) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
+        return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only full admins can do this", show_alert=True)
         return
     try:
         tg_id = int(callback.data.split(":", 1)[1])
@@ -2335,6 +2562,9 @@ async def cb_balance_add_ask(callback: CallbackQuery, state: FSMContext) -> None
     if not await is_admin(callback.from_user.id):
         await callback.answer()
         return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only a full admin can change balances", show_alert=True)
+        return
     try:
         tg_id = int(callback.data.split(":", 1)[1])
     except ValueError:
@@ -2347,6 +2577,9 @@ async def cb_balance_add_ask(callback: CallbackQuery, state: FSMContext) -> None
 async def cb_balance_remove_ask(callback: CallbackQuery, state: FSMContext) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
+        return
+    if await _role_of(callback.from_user.id) != "full":
+        await callback.answer("Only a full admin can change balances", show_alert=True)
         return
     try:
         tg_id = int(callback.data.split(":", 1)[1])
@@ -2377,15 +2610,25 @@ async def balance_op_apply(message: Message, state: FSMContext) -> None:
         await message.answer("Send a positive number, e.g. <code>100</code>:")
         return
 
-    if op == "add":
-        new_balance = await add_balance(tg_id, amount)
-        action = f"added Rs.{amount:g}"
-    else:
-        user = await find_user(tg_id)
-        current = float((user or {}).get("balance", 0) or 0)
-        actual = min(amount, current)
-        new_balance = await add_balance(tg_id, -actual)
-        action = f"removed Rs.{actual:g}"
+    if await features.is_on("dconfirm"):
+        await state.update_data(bal_amount=amount)
+        label = "ADD" if op == "add" else "REMOVE"
+        await message.answer(
+            f"⚠️ <b>Confirm</b>\n\n"
+            f"{label} <b>Rs.{amount:g}</b> "
+            f"{'to' if op == 'add' else 'from'} user <code>{tg_id}</code>?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        ib("Confirm", "uokbal", "success"),
+                        ib("Cancel", "ucalbal", "danger"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    action, new_balance = await _apply_balance(int(tg_id), op, amount)
 
     await state.clear()
     await features.audit(f"Balance {action} for {tg_id} (now Rs.{new_balance:g})")
@@ -2416,6 +2659,46 @@ async def cb_user_manager_back(callback: CallbackQuery, state: FSMContext) -> No
 # ---------------------------------------------------------------- broadcast
 
 
+def _bc_audience_kb(tag: str | None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ib("Everyone", "bcaud:all"), ib("Buyers", "bcaud:buyers")],
+            [ib("Non-buyers", "bcaud:nonbuyers"), ib("A stuff's buyers", "bcaud:stuffbuyers")],
+            [ib("Cancel", "bccancel", "danger")],
+        ]
+    )
+
+
+_AUDIENCE_LABELS = {
+    "all": "everyone",
+    "buyers": "buyers only",
+    "nonbuyers": "non-buyers",
+    "stuffbuyers": "a stuff's buyers",
+}
+
+
+async def _ask_audience(target: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    tag = str(data.get("bc_tag") or "")
+    media = data.get("bc_media") or {}
+    kind = str(media.get("kind") or "")
+    kind_label = {
+        "photo": "photo",
+        "video": "video",
+        "animation": "GIF",
+        "sticker": "sticker",
+        "document": "file",
+    }.get(kind, "text")
+    scope = f"clone <b>@{html.escape(tag)}</b>" if tag else "this bot"
+    await target.answer(
+        f"📣 <b>Audience</b>\n\n"
+        f"Message: <b>{kind_label}</b>\n"
+        f"Send to users of {scope}:\n\n"
+        "Choose who receives it:",
+        reply_markup=_bc_audience_kb(tag or None),
+    )
+
+
 @router.message(AdminStates.broadcast_text, F.text)
 async def broadcast_receive(message: Message, state: FSMContext) -> None:
     if not await is_admin(message.from_user.id):
@@ -2424,24 +2707,170 @@ async def broadcast_receive(message: Message, state: FSMContext) -> None:
     if not text.strip():
         await message.answer("Send a non-empty text:")
         return
-    await state.update_data(broadcast_text=text)
-    recipients = await count_users()
-    preview = text if len(text) <= 800 else text[:800] + "…"
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                ib(f"Send to {recipients} users", "bcsend", "success"),
-                ib("Cancel", "bccancel", "danger"),
-            ]
-        ]
+    await state.update_data(bc_text=text, bc_media=None)
+    await _ask_audience(message, state)
+
+
+@router.message(
+    AdminStates.broadcast_text,
+    F.photo | F.video | F.animation | F.sticker | F.document,
+)
+async def broadcast_media_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    caption = (message.caption or "").strip()
+    if message.sticker:
+        media = {"kind": "sticker", "file_id": message.sticker.file_id}
+    elif message.photo:
+        media = {"kind": "photo", "file_id": message.photo[-1].file_id}
+    elif message.video:
+        media = {"kind": "video", "file_id": message.video.file_id}
+    elif message.animation:
+        media = {"kind": "animation", "file_id": message.animation.file_id}
+    elif message.document:
+        mime = message.document.mime_type or ""
+        if mime.startswith("video/"):
+            media = {"kind": "video", "file_id": message.document.file_id}
+        elif mime.startswith("image/"):
+            media = {"kind": "photo", "file_id": message.document.file_id}
+        else:
+            await message.answer(
+                "Send a photo, video, GIF or sticker (or plain text):"
+            )
+            return
+    else:
+        await message.answer("Send a photo, video, GIF, sticker or text:")
+        return
+    await state.update_data(
+        bc_media=media, bc_text=caption, bc_text_set=bool(caption)
     )
+    if not caption:
+        await state.update_data(bc_text="")
+    await _ask_audience(message, state)
+
+
+@router.message(AdminStates.broadcast_text)
+async def broadcast_invalid(message: Message) -> None:
+    if not await is_admin(message.from_user.id):
+        return
     await message.answer(
-        f"📣 <b>Broadcast preview</b>\n"
-        f"Recipients: <b>{recipients}</b>\n"
-        "──────────────────────\n"
-        f"{preview}",
-        reply_markup=markup,
+        "Send text, a photo, a video, a GIF or a sticker (or press Cancel):"
     )
+
+
+async def _bc_targets(data: dict) -> list[int]:
+    kind = str(data.get("bc_aud") or "all")
+    stuff_id = data.get("bc_stuff")
+    tag = str(data.get("bc_tag") or "")
+    if tag:
+        with as_tag(tag):
+            ids = set(await features.segment_ids(kind, stuff_id))
+        seen = set(await list_user_ids_seen(tag))
+        return sorted(ids & seen)
+    return await features.segment_ids(kind, stuff_id)
+
+
+async def _show_bc_preview(target: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    targets = await _bc_targets(data)
+    text = str(data.get("bc_text") or "")
+    media = data.get("bc_media") or {}
+    kind = str(media.get("kind") or "")
+    kind_label = {
+        "photo": "📷 Photo",
+        "video": "🎬 Video",
+        "animation": "🎞 GIF",
+        "sticker": "🏷 Sticker",
+        "document": "📎 File",
+    }.get(kind, "📝 Text")
+    aud = _AUDIENCE_LABELS.get(str(data.get("bc_aud") or "all"), "everyone")
+    tag = str(data.get("bc_tag") or "")
+    scope = f"clone @{tag}" if tag else "this bot"
+    preview = text if len(text) <= 800 else text[:800] + "…"
+    body = f"{kind_label} — sent as-is"
+    if preview:
+        body += "\n──────────────────────\n" + preview
+    elif kind == "sticker":
+        body += "\n(no caption — stickers cannot carry text)"
+    await target.answer(
+        f"📣 <b>Broadcast preview</b>\n"
+        f"Audience: <b>{aud}</b> of {scope}\n"
+        f"Recipients: <b>{len(targets)}</b>\n"
+        "──────────────────────\n"
+        f"{body}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    ib(f"Send to {len(targets)}", "bcsend", "success"),
+                    ib("Cancel", "bccancel", "danger"),
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("bcaud:"))
+async def cb_bc_audience(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    kind = callback.data.split(":", 1)[1]
+    if kind not in _AUDIENCE_LABELS:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    if kind == "stuffbuyers":
+        items = await list_stuffs(include_archived=True)
+        if not items:
+            await callback.answer("Add a stuff first", show_alert=True)
+            return
+        rows = [
+            [ib(str(s.get("name", "?"))[:48], f"bcastf:{s['_id']}", "primary")]
+            for s in items[:25]
+        ]
+        rows.append([ib("Cancel", "bccancel", "danger")])
+        await callback.answer()
+        await callback.message.answer(
+            "📦 Choose the stuff whose buyers should receive this:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        return
+    await state.update_data(bc_aud=kind, bc_stuff=None)
+    await callback.answer(f"Audience: {_AUDIENCE_LABELS[kind]}")
+    await _show_bc_preview(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("bcastf:"))
+async def cb_bc_stuff_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    doc = await get_stuff(stuff_id)
+    if doc is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    await state.update_data(bc_aud="stuffbuyers", bc_stuff=stuff_id)
+    await callback.answer(f"Audience: buyers of {doc.get('name')}")
+    await _show_bc_preview(callback.message, state)
+
+
+async def _send_one(bot, tg_id: int, data: dict) -> None:
+    text = str(data.get("bc_text") or "")
+    media = data.get("bc_media") or {}
+    kind = str(media.get("kind") or "")
+    file_id = str(media.get("file_id") or "")
+    if kind == "photo" and file_id:
+        await bot.send_photo(tg_id, file_id, caption=text or None)
+    elif kind == "video" and file_id:
+        await bot.send_video(tg_id, file_id, caption=text or None)
+    elif kind == "animation" and file_id:
+        await bot.send_animation(tg_id, file_id, caption=text or None)
+    elif kind == "sticker" and file_id:
+        await bot.send_sticker(tg_id, file_id)
+    elif kind == "document" and file_id:
+        await bot.send_document(tg_id, file_id, caption=text or None)
+    else:
+        await bot.send_message(tg_id, text)
 
 
 @router.callback_query(F.data == "bcsend")
@@ -2450,36 +2879,68 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     data = await state.get_data()
-    text = data.get("broadcast_text")
-    if not text:
+    text = str(data.get("bc_text") or "")
+    media = data.get("bc_media") or {}
+    if not text.strip() and not media.get("file_id"):
         await callback.answer("Nothing to send", show_alert=True)
         return
+    tag = str(data.get("bc_tag") or "")
+    targets = await _bc_targets(data)
     await state.clear()
     await callback.answer("Broadcasting…")
     await _edit_or_send(callback.message, "📣 <b>Broadcasting…</b>", None)
 
-    targets = await list_user_ids()
+    send_bot = callback.bot
+    own_session = None
+    if tag:
+        entries = await clone_manager.load_registry()
+        entry = next((e for e in entries if e.get("tag") == tag), None)
+        if entry is None or not entry.get("token"):
+            await _edit_or_send(
+                callback.message,
+                "❌ Clone not found — it may have been removed.",
+                _back_panel_kb(),
+            )
+            return
+        from aiogram.client.default import DefaultBotProperties
+
+        own_session = Bot(
+            token=str(entry["token"]),
+            default=DefaultBotProperties(parse_mode="HTML"),
+        )
+        send_bot = own_session
+
     sent = 0
     failed = 0
     for tg_id in targets:
         try:
-            await callback.bot.send_message(tg_id, text)
+            await _send_one(send_bot, tg_id, data)
             sent += 1
         except TelegramAPIError:
             failed += 1
         await asyncio.sleep(0.05)
 
+    if own_session is not None:
+        try:
+            await own_session.session.close()
+        except Exception:
+            logger.exception("clone broadcast session close failed")
+
     markup = InlineKeyboardMarkup(
         inline_keyboard=[[ib("Panel", "aback", "primary")]]
     )
-    await features.audit(f"Broadcast sent to {sent} user(s) ({failed} failed)")
+    scope = f"clone {tag}" if tag else "main bot"
+    await features.audit(
+        f"Broadcast ({scope}) sent to {sent} user(s) ({failed} failed)"
+    )
     await _edit_or_send(
         callback.message,
         f"📣 <b>Broadcast finished</b>\n"
         "──────────────────────\n"
         f"✅ Sent: {sent}\n"
         f"❌ Failed: {failed}\n"
-        f"👥 Total: {len(targets)}",
+        f"👥 Targeted: {len(targets)}\n"
+        f"Scope: {scope}",
         markup,
     )
 
@@ -2489,12 +2950,16 @@ async def broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     if not await is_admin(callback.from_user.id):
         await callback.answer()
         return
+    data = await state.get_data()
+    tag = str(data.get("bc_tag") or "")
     await state.clear()
     await callback.answer("Cancelled")
     markup = InlineKeyboardMarkup(
         inline_keyboard=[[ib("Panel", "aback", "primary")]]
     )
     await _edit_or_send(callback.message, "❌ Broadcast cancelled.", markup)
+    if tag:
+        await _show_clones(callback.message)
 
 
 # ---------------------------------------------------------------- stats / vps
@@ -2578,7 +3043,7 @@ async def do_set_showcase(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Showcase image updated.",
         reply_markup=(
-            admin_stuff_view_kb(stuff_id, len((doc or {}).get("lessons", [])))
+            await _stuff_kb_for(doc or {})
             if doc
             else None
         ),
@@ -2671,7 +3136,7 @@ async def cb_proofs_done(callback: CallbackQuery, state: FSMContext) -> None:
     await _edit_or_send(
         callback.message,
         await _stuff_view_text(doc),
-        admin_stuff_view_kb(stuff_id, len(doc.get("lessons", []))),
+        await _stuff_kb_for(doc),
     )
 
 
@@ -2853,6 +3318,17 @@ async def cb_feat_config(callback: CallbackQuery, state: FSMContext) -> None:
             f"⚡ <b>Auto-approve max</b>\n\nCurrent: Rs.{current:g}\n\n"
             "Payment claims up to this amount are approved and delivered "
             "instantly (screenshot still required).\n"
+            "Send an amount, or <code>0</code> to disable:",
+            cancel_inline_kb("apnl:features"),
+        )
+    elif key == "alert":
+        current = await features.get_alert_min()
+        await state.set_state(AdminStates.cfg_alert)
+        await _edit_or_send(
+            target,
+            f"🚨 <b>Big-sale alert</b>\n\nCurrent: Rs.{current:g}\n\n"
+            "Admins get a DM when an approved sale is at least this much "
+            "(new tickets always alert when the alerts feature is on).\n"
             "Send an amount, or <code>0</code> to disable:",
             cancel_inline_kb("apnl:features"),
         )
@@ -3447,7 +3923,7 @@ async def cb_review_none(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------- support
 
 
-def _tickets_text(tickets: list[dict]) -> str:
+def _tickets_text(tickets: list[dict], sla: bool = False) -> str:
     open_count = sum(1 for t in tickets if t.get("status") == "open")
     if not tickets:
         return (
@@ -3459,16 +3935,37 @@ def _tickets_text(tickets: list[dict]) -> str:
         status = ticket.get("status", "open")
         name = html.escape(str(ticket.get("user_name", "?")))[:24]
         body = html.escape(str(ticket.get("text", "")))[:50]
-        lines.append(f"• {name} [{status}]: {body}")
+        suffix = ""
+        if sla and status == "open":
+            age = _age_hours(ticket.get("at"))
+            prio = _prio_for(age)
+            suffix = f" ⏱{age:.0f}h{prio}"
+        lines.append(f"• {name} [{status}]{suffix}: {body}")
+    if sla:
+        lines.append("\n🔴 older than 24h · 🟡 older than 6h")
     return "\n".join(lines)
 
 
 async def _show_support(target: Message) -> None:
     tickets = await features.get_tickets()
-    ordered = sorted(
-        tickets, key=lambda t: t.get("status") != "open"
+    sla = await features.is_on("sla")
+    if sla:
+        ordered = sorted(
+            tickets,
+            key=lambda t: (
+                t.get("status") != "open",
+                -_age_hours(t.get("at")) if t.get("status") == "open" else 0,
+            ),
+        )
+        for ticket in ordered:
+            if ticket.get("status") == "open":
+                ticket["_prio"] = _prio_for(_age_hours(ticket.get("at")))
+    else:
+        ordered = sorted(tickets, key=lambda t: t.get("status") != "open")
+    canned = await features.get_canned() if sla else None
+    await _edit_or_send(
+        target, _tickets_text(ordered, sla=sla), support_kb(ordered, canned=canned)
     )
-    await _edit_or_send(target, _tickets_text(ordered), support_kb(ordered))
 
 
 @router.callback_query(F.data == "tnone")
@@ -3836,7 +4333,7 @@ async def category_set(message: Message, state: FSMContext) -> None:
     )
     await _edit_or_send(
         message, await _stuff_view_text(stuff),
-        admin_stuff_view_kb(str(stuff["_id"]), len(stuff.get("lessons") or [])),
+        await _stuff_kb_for(stuff)
     )
 
 
@@ -3895,7 +4392,7 @@ async def validity_set(message: Message, state: FSMContext) -> None:
     )
     await _edit_or_send(
         message, await _stuff_view_text(stuff),
-        admin_stuff_view_kb(str(stuff["_id"]), len(stuff.get("lessons") or [])),
+        await _stuff_kb_for(stuff)
     )
 
 
@@ -3907,3 +4404,1929 @@ async def cb_admin_back(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
     await _edit_or_send(callback.message, panel_text(), panel_inline_kb())
+
+
+# ---------------------------------------------------------------- batch 3: dashboard
+
+
+def _event_time(value) -> datetime | None:
+    moment = features.parse_expiry(value)
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _dashboard_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ib("Refresh", "bdash", "primary"), ib("Pending", "apnl:pending", "success")],
+            [ib("Analytics", "apnl:analytics", "primary"), ib("Panel", "aback", "primary")],
+        ]
+    )
+
+
+async def _dashboard_text() -> str:
+    from datetime import timezone as _tz
+
+    now = datetime.now(_tz.utc)
+    today = now.date()
+    requests = await list_requests()
+    approved = [r for r in requests if str(r.get("status")) == "approved"]
+    pending = [r for r in requests if str(r.get("status")) == "pending"]
+
+    def _rev(rows: list[dict]) -> float:
+        return sum(float(r.get("amount", 0) or 0) for r in rows)
+
+    today_rows = [r for r in approved if (_event_time(r.get("created_at")) or now).date() == today]
+    users = await count_users()
+    new_today = await count_users_created_after(today.isoformat())
+    buyers = {int(r.get("user_tg_id") or 0) for r in approved if r.get("user_tg_id")}
+    conv = (len(buyers) / users * 100) if users else 0.0
+
+    text = (
+        "?? <b>Dashboard</b>\n"
+        "----------------------\n"
+        f"?? Revenue today: <b>Rs.{_rev(today_rows):g}</b> "
+        f"({len(today_rows)} order(s))\n"
+        f"?? Revenue total: <b>Rs.{_rev(approved):g}</b> ({len(approved)} orders)\n"
+        f"? Pending claims: <b>{len(pending)}</b> (Rs.{_rev(pending):g})\n"
+        f"?? Users: <b>{users}</b> (+{new_today} today)\n"
+        f"?? Buyers: <b>{len(buyers)}</b> (conversion {conv:.1f}%)\n"
+    )
+
+    events: list[tuple[datetime, str]] = []
+    for request in requests:
+        moment = _event_time(request.get("created_at"))
+        if moment is None:
+            continue
+        status = str(request.get("status", "?"))
+        mark = {"approved": "?", "pending": "?", "rejected": "?"}.get(status, "�")
+        events.append(
+            (
+                moment,
+                f"{mark} Rs.{float(request.get('amount', 0) or 0):g} � "
+                f"{html.escape(str(request.get('stuff_name') or '?'))[:40]} "
+                f"(user {request.get('user_tg_id')})",
+            )
+        )
+    if await features.is_on("support"):
+        for ticket in await features.get_tickets():
+            if ticket.get("status") != "open":
+                continue
+            moment = _event_time(ticket.get("at"))
+            if moment is None:
+                continue
+            events.append(
+                (moment, f"?? Ticket from {html.escape(str(ticket.get('user_name', '?')))[:24]}")
+            )
+    if await features.is_on("audit"):
+        for entry in (await features.get_audit())[:6]:
+            moment = _event_time(entry.get("at"))
+            if moment is None:
+                continue
+            events.append((moment, f"?? {html.escape(str(entry.get('text', '')))[:70]}"))
+
+    events.sort(key=lambda e: e[0], reverse=True)
+    text += "----------------------\n<b>Activity feed</b>\n"
+    if not events:
+        text += "No recent activity."
+    for moment, line in events[:10]:
+        text += f"\n� {moment:%H:%M} {line}"
+    return text
+
+
+@router.callback_query(F.data == "bdash")
+async def cb_dashboard_refresh(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer("Refreshed")
+    if not await features.is_on("dash"):
+        await _edit_or_send(callback.message, _off_notice("Dashboard"), _back_panel_kb())
+        return
+    await _edit_or_send(callback.message, await _dashboard_text(), _dashboard_kb())
+
+
+# ------------------------------------------------------------- pending inbox
+
+
+def _pending_summary(request: dict) -> str:
+    moment = _event_time(request.get("created_at"))
+    when = f"{moment:%d %b %H:%M}" if moment else "?"
+    method = request.get("method_name") or request.get("method") or "?"
+    if isinstance(method, dict):
+        method = method.get("name", "?")
+    lines = [
+        f"?? <b>Pending claim {request.get('_id')}</b>",
+        "----------------------",
+        f"Amount: <b>Rs.{float(request.get('amount', 0) or 0):g}</b>",
+        f"Stuffs: {html.escape(str(request.get('stuff_name') or '?'))}",
+        f"User: <code>{request.get('user_tg_id')}</code> "
+        f"@{html.escape(str(request.get('user_username') or '?'))}",
+        f"Method: {html.escape(str(method))}",
+        f"Created: {when}",
+    ]
+    if request.get("coupon"):
+        lines.append(f"Coupon: {html.escape(str(request.get('coupon')))}")
+    return "\n".join(lines)
+
+
+def _pending_kb(requests: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for request in requests:
+        amount = float(request.get("amount", 0) or 0)
+        label = (
+            f"Rs.{amount:g} � {str(request.get('stuff_name') or '?')[:26]} "
+            f"� {request.get('user_tg_id')}"
+        )
+        rows.append([ib(label[:64], f"pin:{request.get('_id')}", "primary")])
+    if not requests:
+        rows.append([ib("No pending claims", "pnone", "primary")])
+    rows.append([ib("Panel", "aback", "primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _pending_rows() -> list[dict]:
+    rows = [r for r in await list_requests() if str(r.get("status")) == "pending"]
+    rows.sort(
+        key=lambda r: _event_time(r.get("created_at")) or datetime.min.replace(
+            tzinfo=timezone.utc
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+async def _show_pending(target: Message) -> None:
+    rows = await _pending_rows()
+    total = len(rows)
+    shown = rows[:15]
+    text = f"?? <b>Pending inbox</b> � {total} waiting\n"
+    if not shown:
+        text += "\nAll payment claims are handled."
+    else:
+        text += "\nTap a claim to review and approve or reject it."
+    await _edit_or_send(target, text, _pending_kb(shown))
+
+
+@router.callback_query(F.data == "pnone")
+async def cb_pending_none(callback: CallbackQuery) -> None:
+    await callback.answer("Nothing pending")
+
+
+@router.callback_query(F.data.startswith("pin:"))
+async def cb_pending_view(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    request_id = callback.data.split(":", 1)[1]
+    request = await get_payment_request(request_id)
+    if request is None:
+        await callback.answer("Request not found", show_alert=True)
+        return
+    kb_rows = [
+        [
+            ib("Approve & unlock", f"payok:{request_id}", "success"),
+            ib("Reject", f"payno:{request_id}", "danger"),
+        ],
+        [ib("Back to inbox", "apnl:pending", "primary")],
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    screenshot = request.get("screenshot_file_id")
+    text = _pending_summary(request)
+    await callback.answer()
+    if screenshot:
+        try:
+            await callback.message.answer_photo(
+                screenshot, caption=text[:1024], reply_markup=markup
+            )
+            return
+        except TelegramAPIError:
+            logger.exception("Pending screenshot send failed")
+    await callback.message.answer(text, reply_markup=markup)
+
+
+# ---------------------------------------------------------------- analytics
+
+
+def _analytics_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ib("Refresh", "banalytics", "primary"), ib("Graph page", "bstats", "primary")],
+            [ib("Panel", "aback", "primary")],
+        ]
+    )
+
+
+async def _analytics_text() -> str:
+    from datetime import timezone as _tz
+
+    now = datetime.now(_tz.utc)
+    requests = await list_requests()
+    approved = [r for r in requests if str(r.get("status")) == "approved"]
+    rejected = [r for r in requests if str(r.get("status")) in {"rejected", "failed"}]
+    pending = [r for r in requests if str(r.get("status")) == "pending"]
+    users = await count_users()
+    buyers = {int(r.get("user_tg_id") or 0) for r in approved if r.get("user_tg_id")}
+
+    def _amount(r) -> float:
+        try:
+            return float(r.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    revenue = sum(_amount(r) for r in approved)
+
+    def _since(days: int) -> float:
+        cutoff = now - timedelta(days=days)
+        total = 0.0
+        for request in approved:
+            moment = _event_time(request.get("created_at"))
+            if moment is not None and moment >= cutoff:
+                total += _amount(request)
+        return total
+
+    conv = (len(buyers) / users * 100) if users else 0.0
+    avg = (revenue / len(approved)) if approved else 0.0
+    text = (
+        "?? <b>Analytics</b>\n"
+        "----------------------\n"
+        f"?? Users: <b>{users}</b>\n"
+        f"?? Buyers: <b>{len(buyers)}</b> � conversion <b>{conv:.1f}%</b>\n"
+        f"?? Orders: approved {len(approved)} / pending {len(pending)} / "
+        f"rejected {len(rejected)}\n"
+        f"?? Revenue: <b>Rs.{revenue:g}</b> � avg order Rs.{avg:g}\n"
+        "----------------------\n"
+        f"Today: <b>Rs.{_since(0):g}</b> � 7 days: <b>Rs.{_since(7):g}</b> � "
+        f"30 days: <b>Rs.{_since(30):g}</b>\n"
+    )
+
+    per_stuff: dict[str, list[float]] = {}
+    for request in approved:
+        raw = str(request.get("stuff_id") or "")
+        for sid in (p.strip() for p in raw.split(",") if p.strip()):
+            bucket = per_stuff.setdefault(sid, [0.0, 0.0])
+            bucket[0] += 1
+            bucket[1] += _amount(request) / max(1, len([p for p in raw.split(",") if p.strip()]))
+    stuffs = {str(s["_id"]): s for s in await list_stuffs(include_archived=True)}
+    ranked = sorted(per_stuff.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
+    if ranked:
+        text += "\n<b>Best sellers</b>\n"
+        for sid, (count, amount) in ranked:
+            name = str((stuffs.get(sid) or {}).get("name") or sid)
+            text += f"� {html.escape(name)[:32]} � {int(count)} sold, Rs.{amount:g}\n"
+
+    coupons = await features.get_coupons()
+    if coupons:
+        per_coupon: dict[str, list[float]] = {}
+        for request in approved:
+            code = str(request.get("coupon") or "").upper()
+            if not code:
+                continue
+            bucket = per_coupon.setdefault(code, [0.0, 0.0])
+            bucket[0] += 1
+            bucket[1] += _amount(request)
+        lines = []
+        for coupon in coupons[:8]:
+            code = str(coupon.get("code", "?")).upper()
+            count, amount = per_coupon.get(code, [0.0, 0.0])
+            if count <= 0:
+                continue
+            lines.append(
+                f"� {html.escape(code)} � {int(count)} use(s), Rs.{amount:g}"
+            )
+        if lines:
+            text += "\n<b>Coupon performance</b>\n" + "\n".join(lines)
+
+    graph = await _graph_text(requests)
+    if graph:
+        text += "\n" + graph
+    return text
+
+
+async def _show_analytics(target: Message) -> None:
+    await _edit_or_send(target, await _analytics_text(), _analytics_kb())
+
+
+@router.callback_query(F.data == "banalytics")
+async def cb_analytics_refresh(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.answer("Refreshed")
+    if not await features.is_on("analytics"):
+        await _edit_or_send(callback.message, _off_notice("Analytics"), _back_panel_kb())
+        return
+    await _edit_or_send(callback.message, await _analytics_text(), _analytics_kb())
+
+
+# -------------------------------------------------------------- global search
+
+
+def _search_text(
+    query: str,
+    users: list[dict],
+    stuffs: list[dict],
+    orders: list[dict],
+    coupons: list[dict],
+    clones: list[dict],
+) -> str:
+    total = len(users) + len(stuffs) + len(orders) + len(coupons) + len(clones)
+    lines = [
+        f"?? <b>Search: {html.escape(query)}</b> � {total} result(s)",
+        "----------------------",
+    ]
+    for user in users[:5]:
+        name = html.escape(str(user.get("full_name") or "?"))[:28]
+        username = user.get("username")
+        lines.append(
+            f"?? {name} ({('@' + html.escape(username)) if username else 'no @'}) "
+            f"� <code>{user.get('tg_id')}</code>"
+        )
+    for stuff in stuffs[:5]:
+        price = float(stuff.get("price", 0) or 0)
+        lines.append(
+            f"?? {html.escape(str(stuff.get('name', '?')))[:40]} � Rs.{price:g}"
+        )
+    for order in orders[:5]:
+        lines.append(
+            f"?? Order {order.get('_id')} � Rs.{float(order.get('amount', 0) or 0):g} "
+            f"� {order.get('status')} � user {order.get('user_tg_id')}"
+        )
+    for coupon in coupons[:5]:
+        lines.append(
+            f"?? {html.escape(str(coupon.get('code', '?')).upper())} � "
+            f"{coupon.get('percent')}% off"
+        )
+    for entry in clones[:5]:
+        lines.append(
+            f"?? clone {html.escape(str(entry.get('username') or entry.get('tag')))}"
+        )
+    if total == 0:
+        lines.append("Nothing matched.")
+    return "\n".join(lines)
+
+
+def _search_kb(
+    users: list[dict],
+    stuffs: list[dict],
+    has_coupons: bool,
+    clones: list[dict],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in users[:5]:
+        uid = user.get("tg_id")
+        name = html.escape(str(user.get("full_name") or uid))[:30]
+        rows.append([ib(f"?? {name}"[:64], f"ucard:{uid}", "primary")])
+    for stuff in stuffs[:5]:
+        rows.append(
+            [ib(f"?? {str(stuff.get('name', '?'))[:40]}"[:64], f"sadm:{stuff['_id']}", "primary")]
+        )
+    for entry in clones[:5]:
+        rows.append(
+            [ib(
+                f"?? {str(entry.get('username') or entry.get('tag'))[:40]}",
+                f"clinfo:{entry.get('tag')}",
+                "primary",
+            )]
+        )
+    if has_coupons:
+        rows.append([ib("Open coupons", "apnl:coupons", "primary")])
+    rows.append([ib("Search again", "apnl:search", "success")])
+    rows.append([ib("Panel", "aback", "primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(AdminStates.search_q, F.text)
+async def admin_search_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await message.answer("Send at least 2 characters:")
+        return
+    await state.clear()
+    needle = query.lower()
+    stuffs = [
+        s
+        for s in await list_stuffs(include_archived=True)
+        if needle in str(s.get("name", "")).lower()
+    ][:6]
+    users = await search_users(query, 5)
+    orders = [r for r in await list_requests() if query.lower() in str(r.get("_id"))][
+        :5
+    ]
+    coupons = [
+        c for c in await features.get_coupons() if needle in str(c.get("code", "")).lower()
+    ][:5]
+    clones = [
+        entry
+        for entry in await clone_manager.load_registry()
+        if needle in str(entry.get("username", "")).lower()
+        or needle in str(entry.get("tag", "")).lower()
+    ][:5]
+    await message.answer(
+        _search_text(query, users, stuffs, orders, coupons, clones),
+        reply_markup=_search_kb(users, stuffs, bool(coupons), clones),
+    )
+
+
+# ---------------------------------------------------------------- offer timers
+
+
+def _timers_kb(entries: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for entry in entries[:20]:
+        rows.append([ib(features.timer_line(entry)[:64], f"tmdel:{entry.get('id')}", "danger")])
+    if not entries:
+        rows.append([ib("No timers yet", "tnone2", "primary")])
+    rows.append([ib("Add timer", "tadd", "success")])
+    rows.append([ib("Panel", "aback", "primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_timers(target: Message) -> None:
+    entries = await features.get_timers()
+    if not entries:
+        text = (
+            "? <b>Offer timers</b>\n\n"
+            "Schedule automatic feature toggles and price changes "
+            "(flash sales: set a sale price now, restore the old price later).\n\n"
+            "No timers scheduled."
+        )
+    else:
+        lines = [f"? <b>Offer timers</b> � {len(entries)} scheduled\n"]
+        for entry in entries[:20]:
+            lines.append(f"� {html.escape(features.timer_line(entry))}")
+        text = "\n".join(lines)
+    await _edit_or_send(target, text, _timers_kb(entries))
+
+
+def _when_prompt(kind: str) -> str:
+    return (
+        f"?? <b>Schedule {kind}</b>\n\n"
+        "Send the server-local time:\n"
+        "� <code>HH:MM</code> � today, or tomorrow if already past\n"
+        "� <code>YYYY-MM-DD HH:MM</code> � exact date and time"
+    )
+
+
+def _parse_when(raw: str) -> datetime | None:
+    raw = (raw or "").strip()
+    local_now = datetime.now().astimezone()
+    try:
+        if features.valid_hhmm(raw) and " " not in raw:
+            hour, minute = (int(part) for part in raw.split(":"))
+            candidate = local_now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if candidate <= local_now:
+                candidate = candidate + timedelta(days=1)
+            return candidate
+        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M")
+        return parsed.replace(tzinfo=local_now.tzinfo)
+    except ValueError:
+        return None
+
+
+@router.callback_query(F.data == "tnone2")
+async def cb_timers_none(callback: CallbackQuery) -> None:
+    await callback.answer("No timers scheduled")
+
+
+@router.callback_query(F.data == "tadd")
+async def cb_timer_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("offer"):
+        await callback.answer("Offer timers are turned off", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "? <b>Add timer</b>\n\nChoose what to schedule:",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [ib("Feature on/off", "tmtype:feat", "primary")],
+                [ib("Price change (flash sale)", "tmtype:price", "primary")],
+                [ib("Back", "apnl:timers", "primary")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "tmtype:feat")
+async def cb_timer_type_feature(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    rows: list[list[InlineKeyboardButton]] = []
+    bucket: list[InlineKeyboardButton] = []
+    for key, (label, _desc) in features.FEATURES.items():
+        bucket.append(ib(label[:30], f"tmf:{key}", "primary"))
+        if len(bucket) == 2:
+            rows.append(bucket)
+            bucket = []
+    if bucket:
+        rows.append(bucket)
+    rows.append([ib("Back", "apnl:timers", "primary")])
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Pick the feature</b> to toggle automatically:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data == "tmtype:price")
+async def cb_timer_type_price(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    items = await list_stuffs(include_archived=True)
+    if not items:
+        await callback.answer("Add a stuff first", show_alert=True)
+        return
+    rows = [
+        [ib(f"{s.get('name')} � Rs.{float(s.get('price', 0) or 0):g}"[:64], f"tmp:{s['_id']}", "primary")]
+        for s in items[:30]
+    ]
+    rows.append([ib("Back", "apnl:timers", "primary")])
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Pick the stuff</b> whose price changes on schedule:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("tmf:"))
+async def cb_timer_feature_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    key = callback.data.split(":", 1)[1]
+    if key not in features.FEATURES:
+        await callback.answer("Unknown feature", show_alert=True)
+        return
+    label = features.FEATURES[key][0]
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>{label}</b>\n\nChoose the new state:",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [ib("Turn ON", f"tmv:{key}:1", "success"), ib("Turn OFF", f"tmv:{key}:0", "danger")],
+                [ib("Back", "apnl:timers", "primary")],
+            ]
+        ),
+    )
+    await state.clear()
+    await state.update_data(tm_kind="feature", tm_target=key)
+
+
+@router.callback_query(F.data.startswith("tmv:"))
+async def cb_timer_feature_value(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    _, key, flag = parts
+    await state.update_data(tm_value=flag == "1", tm_phase="")
+    await state.set_state(AdminStates.timer_time)
+    label = features.FEATURES.get(key, (key, ""))[0]
+    state_text = "ON" if flag == "1" else "OFF"
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"? <b>{label} ? {state_text}</b>\n\n" + _when_prompt("feature toggle"),
+        cancel_inline_kb("apnl:timers"),
+    )
+
+
+@router.callback_query(F.data.startswith("tmp:"))
+async def cb_timer_stuff_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    doc = await get_stuff(stuff_id)
+    if doc is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        tm_kind="price",
+        tm_target=str(doc["_id"]),
+        tm_restore_value=float(doc.get("price", 0) or 0),
+        tm_name=str(doc.get("name", "?")),
+        tm_phase="",
+    )
+    await state.set_state(AdminStates.timer_price)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Price timer</b> for <b>{html.escape(doc.get('name', '?'))}</b>\n\n"
+        f"Current price: Rs.{float(doc.get('price', 0) or 0):g}\n\n"
+        "Send the <b>new price</b> that applies at the scheduled time:",
+        cancel_inline_kb("apnl:timers"),
+    )
+
+
+@router.message(AdminStates.timer_price, F.text)
+async def timer_price_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    digits = "".join(ch for ch in raw if ch.isdigit() or ch == ".")
+    try:
+        price = float(digits) if digits else 0.0
+    except ValueError:
+        price = 0.0
+    if price < 0:
+        await message.answer("Send a valid price, e.g. <code>99</code>:")
+        return
+    await state.update_data(tm_value=price, tm_phase="")
+    await state.set_state(AdminStates.timer_time)
+    await message.answer(
+        "?? <b>Price timer</b>\n\n"
+        f"New price: Rs.{price:g}\n\n" + _when_prompt("price change"),
+        reply_markup=cancel_inline_kb("apnl:timers"),
+    )
+
+
+@router.message(AdminStates.timer_time, F.text)
+async def timer_time_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    moment = _parse_when(message.text or "")
+    if moment is None:
+        await message.answer(
+            "Could not read that time. Send HH:MM or YYYY-MM-DD HH:MM:"
+        )
+        return
+    data = await state.get_data()
+    kind = str(data.get("tm_kind") or "")
+    phase = str(data.get("tm_phase") or "")
+    if kind == "feature":
+        await features.add_timer(
+            "feature",
+            data.get("tm_target"),
+            bool(data.get("tm_value")),
+            moment.astimezone().isoformat(),
+            note=str(data.get("tm_note") or ""),
+        )
+        await features.audit(
+            f"Timer set: {data.get('tm_target')} "
+            f"{'ON' if data.get('tm_value') else 'OFF'} at {moment:%d %b %H:%M}"
+        )
+        await state.clear()
+        await message.answer(
+            f"? Timer scheduled for {moment:%d %b %Y %H:%M} (server time).",
+            reply_markup=panel_inline_kb(),
+        )
+        await _show_timers(message)
+        return
+    if kind != "price":
+        await state.clear()
+        await message.answer("Session expired, start again.", reply_markup=panel_inline_kb())
+        return
+    if phase == "restore":
+        restore_at = moment
+        main_at = features.parse_expiry(data.get("tm_at"))
+        if main_at is None:
+            await state.clear()
+            await message.answer("Session expired, start again.", reply_markup=panel_inline_kb())
+            return
+        if main_at.tzinfo is None:
+            main_at = main_at.replace(tzinfo=main_at.astimezone().tzinfo)
+        if restore_at <= main_at:
+            await message.answer(
+                "Restore time must be after the sale time. Send a later HH:MM or date:"
+            )
+            return
+        await features.add_timer(
+            "price",
+            data.get("tm_target"),
+            float(data.get("tm_value") or 0),
+            data.get("tm_at"),
+            note=f"{data.get('tm_name', 'stuff')} sale price",
+        )
+        await features.add_timer(
+            "price",
+            data.get("tm_target"),
+            float(data.get("tm_restore_value") or 0),
+            restore_at.astimezone().isoformat(),
+            note=f"{data.get('tm_name', 'stuff')} restore",
+        )
+        await features.audit(
+            f"Flash sale timer: stuff {data.get('tm_target')} ? "
+            f"Rs.{float(data.get('tm_value') or 0):g} at {main_at:%d %b %H:%M}, "
+            f"restore Rs.{float(data.get('tm_restore_value') or 0):g}"
+        )
+        await state.clear()
+        await message.answer(
+            f"? Flash sale scheduled: price change {main_at:%d %b %H:%M}, "
+            f"restore {restore_at:%d %b %H:%M} (server time).",
+            reply_markup=panel_inline_kb(),
+        )
+        await _show_timers(message)
+        return
+    await state.update_data(tm_at=moment.astimezone().isoformat(), tm_phase="wait")
+    await state.set_state(AdminStates.timer_time)
+    await message.answer(
+        f"?? Sale starts {moment:%d %b %H:%M}.\n\n"
+        "Now schedule when the <b>old price comes back</b> "
+        "(restore time), or press Skip to keep the new price forever:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [ib("Set restore time", "tmrestore", "primary")],
+                [ib("Skip (keep new price)", "tmskip", "success")],
+                [ib("Cancel", "apnl:timers", "danger")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "tmrestore")
+async def cb_timer_restore(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.update_data(tm_phase="restore")
+    await state.set_state(AdminStates.timer_time)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Restore time</b>\n\n" + _when_prompt("price restore"),
+        cancel_inline_kb("apnl:timers"),
+    )
+
+
+@router.callback_query(F.data == "tmskip")
+async def cb_timer_skip_restore(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    at = data.get("tm_at")
+    if not at:
+        await state.clear()
+        await callback.answer("Session expired", show_alert=True)
+        return
+    await features.add_timer(
+        "price",
+        data.get("tm_target"),
+        float(data.get("tm_value") or 0),
+        at,
+        note=f"{data.get('tm_name', 'stuff')} price change",
+    )
+    await features.audit(
+        f"Timer set: stuff {data.get('tm_target')} price ? "
+        f"Rs.{float(data.get('tm_value') or 0):g}"
+    )
+    await state.clear()
+    await callback.answer("Timer scheduled")
+    await _show_timers(callback.message)
+
+
+@router.callback_query(F.data.startswith("tmdel:"))
+async def cb_timer_delete(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    timer_id = callback.data.split(":", 1)[1]
+    await features.drop_timer(timer_id)
+    await features.audit(f"Timer removed: {timer_id}")
+    await callback.answer("Timer removed")
+    await _show_timers(callback.message)
+
+
+# ------------------------------------------------------------- media library
+
+
+def _media_kb(items: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, item in enumerate(items[:20]):
+        label = f"{index + 1}. {item.get('name', '?')} ({item.get('kind', '?')})"
+        rows.append([ib(label[:64], f"mvi:{item.get('id')}", "primary")])
+    if not items:
+        rows.append([ib("Library is empty", "mnone", "primary")])
+    rows.append([ib("Add media", "mad", "success")])
+    rows.append([ib("Panel", "aback", "primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_media(target: Message) -> None:
+    items = await features.get_media()
+    if items:
+        text = (
+            f"?? <b>Media library</b> � {len(items)} item(s)\n\n"
+            "Reusable videos and photos. Tap an item to reuse it in a stuff "
+            "or delete it."
+        )
+    else:
+        text = (
+            "?? <b>Media library</b>\n\n"
+            "Empty. Press Add media and send a video, photo or GIF "
+            "(caption becomes the title) to reuse it later in any stuff."
+        )
+    await _edit_or_send(target, text, _media_kb(items))
+
+
+@router.callback_query(F.data == "mnone")
+async def cb_media_none(callback: CallbackQuery) -> None:
+    await callback.answer("Library is empty")
+
+
+@router.callback_query(F.data == "mad")
+async def cb_media_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("medialib"):
+        await callback.answer("Media library is turned off", show_alert=True)
+        return
+    await state.set_state(AdminStates.media_add)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Add media</b>\n\n"
+        "Send a <b>video, photo or GIF</b>.\n"
+        "Caption becomes the item title (first line).",
+        cancel_inline_kb("apnl:media"),
+    )
+
+
+@router.message(AdminStates.media_add, F.photo | F.video | F.animation | F.document)
+async def media_add_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    extracted = _extract_media(message)
+    if extracted is None and message.sticker:
+        await message.answer("Send a video, photo or GIF (not a sticker):")
+        return
+    if extracted is None:
+        await message.answer("Send a video, photo or GIF:")
+        return
+    kind, file_id, title = extracted
+    items = await features.get_media()
+    name = title or f"Media {len(items) + 1}"
+    await features.add_media(name, kind, file_id)
+    await features.audit(f"Media library: added {name} ({kind})")
+    await state.clear()
+    await message.answer(f"? Added <b>{html.escape(name)}</b> to the library.")
+    await _show_media(message)
+
+
+@router.message(AdminStates.media_add)
+async def media_add_invalid(message: Message) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    await message.answer("Send a video, photo or GIF (or press Cancel):")
+
+
+@router.callback_query(F.data.startswith("mvi:"))
+async def cb_media_view(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    media_id = callback.data.split(":", 1)[1]
+    items = await features.get_media()
+    item = next((m for m in items if str(m.get("id")) == media_id), None)
+    if item is None:
+        await callback.answer("Item not found", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>{html.escape(str(item.get('name', '?')))}</b>\n"
+        "----------------------\n"
+        f"Type: {item.get('kind')}\n"
+        f"Added: {str(item.get('at', '?'))[:16]}\n\n"
+        "Use in a stuff to append it as a lesson, or delete it.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    ib("Use in a stuff", f"muse:{media_id}", "success"),
+                    ib("Delete", f"mdel:{media_id}", "danger"),
+                ],
+                [ib("Back", "apnl:media", "primary")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("mdel:"))
+async def cb_media_delete(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    media_id = callback.data.split(":", 1)[1]
+    await features.drop_media(media_id)
+    await features.audit(f"Media library: removed {media_id}")
+    await callback.answer("Deleted")
+    await _show_media(callback.message)
+
+
+@router.callback_query(F.data.startswith("muse:"))
+async def cb_media_use(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    media_id = callback.data.split(":", 1)[1]
+    items = await features.get_media()
+    item = next((m for m in items if str(m.get("id")) == media_id), None)
+    if item is None:
+        await callback.answer("Item not found", show_alert=True)
+        return
+    stuffs = await list_stuffs(include_archived=True)
+    if not stuffs:
+        await callback.answer("Add a stuff first", show_alert=True)
+        return
+    rows = [
+        [ib(str(s.get("name", "?"))[:48], f"musest:{media_id}:{s['_id']}", "primary")]
+        for s in stuffs[:25]
+    ]
+    rows.append([ib("Back", "apnl:media", "primary")])
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? Choose the stuff for <b>{html.escape(str(item.get('name', '?')))}</b>:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("musest:"))
+async def cb_media_use_pick(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    _, media_id, stuff_id = parts
+    items = await features.get_media()
+    item = next((m for m in items if str(m.get("id")) == media_id), None)
+    doc = await get_stuff(stuff_id)
+    if item is None or doc is None:
+        await callback.answer("Not found", show_alert=True)
+        return
+    lesson = {
+        "title": str(item.get("name", "Lesson"))[:80],
+        "description": "",
+        "media_type": str(item.get("kind", "video")),
+        "file_id": str(item.get("file_id", "")),
+        "is_demo": False,
+    }
+    await append_lessons(str(doc["_id"]), [lesson])
+    await features.audit(
+        f"Media library: added {item.get('name')} to stuff {doc['_id']}"
+    )
+    await callback.answer("Added to stuff")
+    await _edit_or_send(
+        callback.message,
+        await _stuff_view_text(doc),
+        admin_stuff_view_kb(
+            str(doc["_id"]),
+            len(doc.get("lessons") or []),
+            show_ctrl=await features.is_on("stuffctrl"),
+            archived=bool(doc.get("archived")),
+            featured=bool(doc.get("featured")),
+        ),
+    )
+
+
+# ------------------------------------------------------------- backup / restore
+
+
+async def _show_backup(target: Message) -> None:
+    from database.store import backend_name
+
+    backend = backend_name()
+    hint = (
+        "Upload the <b>.db</b> file from a previous backup."
+        if backend == "sqlite"
+        else "Upload the <b>.json</b> dump from a previous backup."
+    )
+    text = (
+        "?? <b>Backup and restore</b>\n"
+        "----------------------\n"
+        f"Database: <b>{backend}</b>\n\n"
+        "� <b>Backup now</b> sends a fresh copy of the database "
+        "(to the log group, or to your private chat).\n"
+        "� <b>Restore</b> replaces the database with an uploaded backup.\n\n"
+        f"{hint}\n"
+        "Restoring wipes current data, so back up first.\n"
+        + ("Restored changes apply after a bot restart." if backend == "sqlite" else "")
+    )
+    await _edit_or_send(
+        target,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [ib("Backup now", "bknow", "success"), ib("Restore", "brest", "danger")],
+                [ib("Panel", "aback", "primary")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "bknow")
+async def cb_backup_now(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("backup"):
+        await callback.answer("Backup is turned off", show_alert=True)
+        return
+    from utils.scheduler import _backup
+
+    await callback.answer("Creating backup�")
+    await _backup(callback.bot, datetime.now(timezone.utc))
+    await features.audit("Manual backup created")
+    await callback.message.answer(
+        "? Backup created � check your log group or private chat.",
+        reply_markup=_back_panel_kb(),
+    )
+
+
+@router.callback_query(F.data == "brest")
+async def cb_restore_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("backup"):
+        await callback.answer("Backup is turned off", show_alert=True)
+        return
+    from database.store import backend_name
+
+    backend = backend_name()
+    hint = (
+        "Send the <b>.db</b> backup file."
+        if backend == "sqlite"
+        else "Send the <b>.json</b> backup dump."
+    )
+    await state.set_state(AdminStates.restore_file)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Restore database</b>\n\n"
+        f"{hint}\n"
+        "Current data will be replaced. This cannot be undone.",
+        cancel_inline_kb("apnl:backup"),
+    )
+
+
+@router.message(AdminStates.restore_file, F.document)
+async def restore_file_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    from database.store import backend_name, restore_collections
+
+    document = message.document
+    if document is None:
+        return
+    size = int(document.file_size or 0)
+    if size <= 0 or size > MAX_ZIP_SIZE:
+        await message.answer(
+            f"File too large or empty (limit {MAX_ZIP_SIZE} bytes). "
+            "Send the backup file:",
+            reply_markup=cancel_inline_kb("apnl:backup"),
+        )
+        return
+    try:
+        downloaded = await message.bot.download(document)
+        data = downloaded.read() if downloaded is not None else None
+    except TelegramAPIError:
+        data = None
+    if not data:
+        await message.answer(
+            "Could not download that file. Try again:",
+            reply_markup=cancel_inline_kb("apnl:backup"),
+        )
+        return
+
+    backend = backend_name()
+    if backend == "sqlite":
+        path = DATABASE_URL.replace("sqlite:///", "").replace("sqlite://", "")
+        staged = f"{path}.restore"
+        try:
+            with open(staged, "wb") as handle:
+                handle.write(data)
+        except OSError:
+            logger.exception("restore staging failed")
+            await state.clear()
+            await message.answer(
+                "? Could not write the restore file.", reply_markup=_back_panel_kb()
+            )
+            return
+        await state.clear()
+        await features.audit("Restore file staged (restart to apply)")
+        await message.answer(
+            "? Restore file staged.\n\n"
+            "Restart the bot and it will come back with this backup. "
+            "The current database is saved as "
+            f"<code>{path}.replaced</code>.",
+            reply_markup=_back_panel_kb(),
+        )
+        return
+
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or not any(
+        isinstance(payload.get(k), list)
+        for k in ("users", "stuffs", "settings", "payment_requests")
+    ):
+        await state.clear()
+        await message.answer(
+            "? That does not look like a valid backup dump.",
+            reply_markup=_back_panel_kb(),
+        )
+        return
+    try:
+        await restore_collections(payload)
+    except Exception:
+        logger.exception("mongo restore failed")
+        await state.clear()
+        await message.answer(
+            "? Restore failed (see logs).", reply_markup=_back_panel_kb()
+        )
+        return
+    await state.clear()
+    await features.audit("Database restored from upload")
+    await message.answer(
+        "? Database restored from the backup.", reply_markup=_back_panel_kb()
+    )
+
+
+@router.message(AdminStates.restore_file)
+async def restore_file_invalid(message: Message) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    await message.answer("Send the backup file as a document (or press Cancel):")
+
+
+# ------------------------------------------------------------------ bulk ops
+
+
+async def _show_stuffs_list(target: Message, state: FSMContext) -> None:
+    items = await list_stuffs(include_archived=True)
+    data = await state.get_data()
+    show_bulk = await features.is_on("bulk") and bool(items)
+    bulk_mode = bool(data.get("bulk_mode")) and show_bulk
+    if bulk_mode:
+        selected = {str(x) for x in (data.get("bulk_ids") or [])}
+        text = (
+            f"?? <b>Stuffs</b> � {len(selected)} selected\n\n"
+            "Tap stuffs to select them, then use the action bar below."
+        )
+        markup = admin_stuffs_kb(items, bulk_mode=True, selected=selected)
+    else:
+        text = (
+            "?? <b>Stuffs</b>\n\nTap a stuff to manage it."
+            if items
+            else "?? <b>Stuffs</b>\n\nNo stuffs yet."
+        )
+        markup = admin_stuffs_kb(items, show_bulk=show_bulk)
+    await _edit_or_send(target, text, markup)
+
+
+async def _bulk_ids(state: FSMContext) -> list[str]:
+    data = await state.get_data()
+    return [str(x) for x in (data.get("bulk_ids") or [])]
+
+
+@router.callback_query(F.data == "bselm")
+async def cb_bulk_mode(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("bulk"):
+        await callback.answer("Bulk ops are turned off", show_alert=True)
+        return
+    await state.set_state(None)
+    await state.update_data(bulk_mode=True, bulk_ids=[])
+    await callback.answer("Select mode on")
+    await _show_stuffs_list(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("bsel:"))
+async def cb_bulk_select(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if not data.get("bulk_mode"):
+        await callback.answer("Press Bulk select first", show_alert=True)
+        return
+    selected = [str(x) for x in (data.get("bulk_ids") or [])]
+    if stuff_id in selected:
+        selected.remove(stuff_id)
+    else:
+        selected.append(stuff_id)
+    await state.update_data(bulk_ids=selected)
+    await callback.answer(f"{len(selected)} selected")
+    await _show_stuffs_list(callback.message, state)
+
+
+@router.callback_query(F.data == "bscancel")
+async def cb_bulk_done(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.clear()
+    await callback.answer("Selection cleared")
+    await _show_stuffs_list(callback.message, state)
+
+
+@router.callback_query(F.data == "sbprice")
+async def cb_bulk_price_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    ids = await _bulk_ids(state)
+    if not ids:
+        await callback.answer("Select stuffs first", show_alert=True)
+        return
+    await state.set_state(AdminStates.bulk_price)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Bulk price</b> for {len(ids)} stuff(s)\n\n"
+        "Send the new price, e.g. <code>199</code>:",
+        cancel_inline_kb("aback"),
+    )
+
+
+@router.message(AdminStates.bulk_price, F.text)
+async def bulk_price_apply(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    digits = "".join(ch for ch in raw if ch.isdigit() or ch == ".")
+    try:
+        price = float(digits) if digits else 0.0
+    except ValueError:
+        price = 0.0
+    if price < 0:
+        await message.answer("Send a valid price, e.g. <code>199</code>:")
+        return
+    ids = await _bulk_ids(state)
+    for stuff_id in ids:
+        await set_stuff_price(stuff_id, price)
+    await features.audit(f"Bulk price set to Rs.{price:g} for {len(ids)} stuff(s)")
+    await state.set_state(None)
+    await message.answer(f"? Price set for {len(ids)} stuff(s).")
+    await _show_stuffs_list(message, state)
+
+
+@router.callback_query(F.data == "sbcat")
+async def cb_bulk_category_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    ids = await _bulk_ids(state)
+    if not ids:
+        await callback.answer("Select stuffs first", show_alert=True)
+        return
+    await state.set_state(AdminStates.bulk_cat)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Bulk category</b> for {len(ids)} stuff(s)\n\n"
+        "Send the category name (or <code>-</code> to clear):",
+        cancel_inline_kb("aback"),
+    )
+
+
+@router.message(AdminStates.bulk_cat, F.text)
+async def bulk_category_apply(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    category = "" if raw in {"-", "�"} else raw[:60]
+    ids = await _bulk_ids(state)
+    for stuff_id in ids:
+        await set_stuff_category(stuff_id, category)
+    await features.audit(
+        f"Bulk category set to {category or '(cleared)'} for {len(ids)} stuff(s)"
+    )
+    await state.set_state(None)
+    await message.answer(f"? Category set for {len(ids)} stuff(s).")
+    await _show_stuffs_list(message, state)
+
+
+async def _bulk_flags(state: FSMContext, callback: CallbackQuery, archived: bool) -> None:
+    ids = await _bulk_ids(state)
+    if not ids:
+        await callback.answer("Select stuffs first", show_alert=True)
+        return
+    for stuff_id in ids:
+        await set_stuff_flags(stuff_id, archived=archived)
+    action = "archived" if archived else "restored"
+    await features.audit(f"Bulk {action}: {len(ids)} stuff(s)")
+    await callback.answer(f"{len(ids)} stuff(s) {action}")
+    await _show_stuffs_list(callback.message, state)
+
+
+@router.callback_query(F.data == "sbarch")
+async def cb_bulk_archive(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await _bulk_flags(state, callback, True)
+
+
+@router.callback_query(F.data == "sbrst")
+async def cb_bulk_restore(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await _bulk_flags(state, callback, False)
+
+
+async def _bulk_delete_apply(callback: CallbackQuery, state: FSMContext) -> None:
+    ids = await _bulk_ids(state)
+    if not ids:
+        await callback.answer("Select stuffs first", show_alert=True)
+        return
+    for stuff_id in ids:
+        await delete_stuff(stuff_id)
+    await features.audit(f"Bulk deleted {len(ids)} stuff(s)")
+    await state.clear()
+    await callback.answer(f"Deleted {len(ids)}")
+    await _show_stuffs_list(callback.message, state)
+
+
+@router.callback_query(F.data == "sbdel")
+async def cb_bulk_delete_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    ids = await _bulk_ids(state)
+    if not ids:
+        await callback.answer("Select stuffs first", show_alert=True)
+        return
+    if not await features.is_on("dconfirm"):
+        await _bulk_delete_apply(callback, state)
+        return
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Delete {len(ids)} stuff(s)?</b>\n\n"
+        "Lessons and buyer history references are removed. This cannot be undone.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    ib(f"Delete {len(ids)}", "sbdelok", "danger"),
+                    ib("Cancel", "bscancel", "primary"),
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "sbdelok")
+async def cb_bulk_delete_ok(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await _bulk_delete_apply(callback, state)
+
+
+# ------------------------------------------------------------ stuff controls
+
+
+async def _reshow_stuff_view(target: Message, stuff_id) -> None:
+    doc = await get_stuff(stuff_id)
+    if doc is None:
+        await _edit_or_send(target, "Stuffs deleted.", _back_panel_kb())
+        return
+    await _edit_or_send(
+        target,
+        await _stuff_view_text(doc),
+        admin_stuff_view_kb(
+            str(doc["_id"]),
+            len(doc.get("lessons") or []),
+            show_ctrl=await features.is_on("stuffctrl"),
+            archived=bool(doc.get("archived")),
+            featured=bool(doc.get("featured")),
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("sarch:"))
+async def cb_stuff_archive_toggle(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("stuffctrl"):
+        await callback.answer("Stuffs controls are turned off", show_alert=True)
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    doc = await get_stuff(stuff_id)
+    if doc is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    new_value = not bool(doc.get("archived"))
+    await set_stuff_flags(stuff_id, archived=new_value)
+    await features.audit(
+        f"Stuff {doc.get('name')}: {'archived' if new_value else 'restored'}"
+    )
+    await callback.answer("Archived" if new_value else "Restored")
+    await _reshow_stuff_view(callback.message, stuff_id)
+
+
+@router.callback_query(F.data.startswith("spin:"))
+async def cb_stuff_pin_toggle(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("stuffctrl"):
+        await callback.answer("Stuffs controls are turned off", show_alert=True)
+        return
+    stuff_id = callback.data.split(":", 1)[1]
+    doc = await get_stuff(stuff_id)
+    if doc is None:
+        await callback.answer("Stuffs deleted", show_alert=True)
+        return
+    new_value = not bool(doc.get("featured"))
+    await set_stuff_flags(stuff_id, featured=new_value)
+    await features.audit(
+        f"Stuff {doc.get('name')}: {'pinned' if new_value else 'unpinned'}"
+    )
+    await callback.answer("Pinned" if new_value else "Unpinned")
+    await _reshow_stuff_view(callback.message, stuff_id)
+
+
+# ---------------------------------------------------------------- admin roles
+
+
+@router.callback_query(F.data.startswith("admrole:"))
+async def cb_admin_role_pick(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("roles"):
+        await callback.answer("Admin roles are turned off", show_alert=True)
+        return
+    try:
+        tg_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Role for admin</b> <code>{tg_id}</code>\n\n"
+        "� Full � everything\n"
+        "� Support � users, tickets, audit\n"
+        "� Content � stuffs, media, start/help text, reviews",
+        role_kb(tg_id),
+    )
+
+
+@router.callback_query(F.data.startswith("admr:"))
+async def cb_admin_role_set(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("roles"):
+        await callback.answer("Admin roles are turned off", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    _, raw_id, role = parts
+    if role not in {"full", "support", "content"}:
+        await callback.answer("Unknown role", show_alert=True)
+        return
+    try:
+        tg_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    await set_admin_role(tg_id, role)
+    await features.audit(f"Admin {tg_id} role set to {role}")
+    await callback.answer(f"Role: {role}")
+    items = await get_admin_list()
+    await _edit_or_send(
+        callback.message,
+        ADMINS_TEXT,
+        admins_kb_view(items, show_roles=await features.is_on("roles")),
+    )
+
+
+# -------------------------------------------------------------- canned replies
+
+
+def _age_hours(value) -> float:
+    moment = _event_time(value)
+    if moment is None:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - moment).total_seconds() / 3600)
+
+
+def _prio_for(age: float) -> str:
+    if age > 24:
+        return " ??"
+    if age > 6:
+        return " ??"
+    return ""
+
+
+@router.callback_query(F.data.startswith("cannone:"))
+async def cb_canned_view(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    index = int(callback.data.split(":", 1)[1])
+    items = await features.get_canned()
+    if 0 <= index < len(items):
+        await callback.answer(items[index][:180], show_alert=True)
+    else:
+        await callback.answer("Canned reply not found", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("candel:"))
+async def cb_canned_delete(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("sla"):
+        await callback.answer("Support priority is turned off", show_alert=True)
+        return
+    index = int(callback.data.split(":", 1)[1])
+    items = await features.get_canned()
+    if not 0 <= index < len(items):
+        await callback.answer("Not found", show_alert=True)
+        return
+    removed = items.pop(index)
+    await features.save_canned(items)
+    await features.audit(f"Canned reply removed: {removed[:30]}")
+    await callback.answer("Deleted")
+    await _show_support(callback.message)
+
+
+@router.callback_query(F.data == "canadd")
+async def cb_canned_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("sla"):
+        await callback.answer("Support priority is turned off", show_alert=True)
+        return
+    await state.set_state(AdminStates.canned_add)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        "?? <b>Add canned reply</b>\n\n"
+        "Send the quick reply text (HTML supported). "
+        "It appears on the Support page for one-tap replies.",
+        cancel_inline_kb("apnl:support"),
+    )
+
+
+@router.message(AdminStates.canned_add, F.text)
+async def canned_add_receive(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Send a non-empty reply:")
+        return
+    items = await features.get_canned()
+    if len(items) >= 20:
+        await state.clear()
+        await message.answer("Canned list is full (20 max).", reply_markup=panel_inline_kb())
+        return
+    items.append(text[:500])
+    await features.save_canned(items)
+    await features.audit(f"Canned reply added: {text[:30]}")
+    await state.clear()
+    await message.answer("? Canned reply saved.")
+    await _show_support(message)
+
+
+@router.callback_query(F.data.startswith("tcan:"))
+async def cb_ticket_canned_send(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    _, ticket_id, index_raw = parts
+    try:
+        index = int(index_raw)
+    except ValueError:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    items = await features.get_canned()
+    if not 0 <= index < len(items):
+        await callback.answer("Canned reply not found", show_alert=True)
+        return
+    ticket = next(
+        (t for t in await features.get_tickets() if str(t.get("id")) == ticket_id),
+        None,
+    )
+    if ticket is None:
+        await callback.answer("Ticket not found", show_alert=True)
+        return
+    reply = items[index]
+    try:
+        await callback.bot.send_message(
+            int(ticket.get("user_tg_id")),
+            f"?? <b>Support reply</b>\n\n{reply}",
+        )
+        sent = True
+    except TelegramAPIError:
+        logger.exception("Canned ticket reply failed")
+        sent = False
+    await features.audit(
+        f"Canned reply to {ticket.get('user_name')} ({'sent' if sent else 'FAILED'})"
+    )
+    await callback.answer("Reply sent" if sent else "Could not message user")
+
+
+# --------------------------------------------------------------- customer CRM
+
+
+@router.callback_query(F.data.startswith("unote:"))
+async def cb_user_note_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("crm"):
+        await callback.answer("Customer timeline is turned off", show_alert=True)
+        return
+    try:
+        tg_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    current = await features.get_note(tg_id)
+    await state.set_state(AdminStates.user_note)
+    await state.update_data(note_user=tg_id)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Private note</b> for <code>{tg_id}</code>\n\n"
+        f"Current: {html.escape(current) if current else '(empty)'}\n\n"
+        "Send the note text (or <code>-</code> to clear):",
+        cancel_inline_kb(f"ucard:{tg_id}"),
+    )
+
+
+@router.message(AdminStates.user_note, F.text)
+async def user_note_save(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    tg_id = data.get("note_user")
+    if tg_id is None:
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    note = "" if raw in {"-", "�"} else raw[:500]
+    await features.set_note(int(tg_id), note)
+    await features.audit(f"Note {'cleared' if not note else 'updated'} for {tg_id}")
+    await state.clear()
+    await message.answer("? Note saved.")
+    await _show_user_card(message, int(tg_id))
+
+
+@router.callback_query(F.data.startswith("utag:"))
+async def cb_user_tag_toggle(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("crm"):
+        await callback.answer("Customer timeline is turned off", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    _, raw_id, tag = parts
+    try:
+        tg_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Invalid", show_alert=True)
+        return
+    active = await features.toggle_tag(tg_id, tag)
+    await features.audit(f"Tag {tag} {'on' if active else 'off'} for {tg_id}")
+    await callback.answer(f"{tag}: {'on' if active else 'off'}")
+    await _show_user_card(callback.message, tg_id)
+
+
+# ----------------------------------------------------------- balance confirm
+
+
+async def _apply_balance(tg_id: int, op: str, amount: float) -> tuple[str, float]:
+    if op == "add":
+        new_balance = await add_balance(tg_id, amount)
+        return f"added Rs.{amount:g}", new_balance
+    user = await find_user(tg_id)
+    current = float((user or {}).get("balance", 0) or 0)
+    actual = min(amount, current)
+    new_balance = await add_balance(tg_id, -actual)
+    return f"removed Rs.{actual:g}", new_balance
+
+
+@router.callback_query(F.data == "uokbal")
+async def cb_balance_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    tg_id = data.get("target_id")
+    op = str(data.get("op") or "add")
+    try:
+        amount = float(data.get("bal_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if tg_id is None or amount <= 0:
+        await state.clear()
+        await callback.answer("Session expired", show_alert=True)
+        return
+    action, new_balance = await _apply_balance(int(tg_id), op, amount)
+    await state.clear()
+    await features.audit(
+        f"Balance {action} for {tg_id} (now Rs.{new_balance:g})"
+    )
+    await callback.answer("Balance updated")
+    await _show_user_card(callback.message, int(tg_id))
+
+
+@router.callback_query(F.data == "ucalbal")
+async def cb_balance_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    tg_id = data.get("target_id")
+    await state.clear()
+    await callback.answer("Cancelled")
+    if tg_id is not None:
+        await _show_user_card(callback.message, int(tg_id))
+
+
+# ----------------------------------------------------------- clone dashboard
+
+
+async def _clone_network_text(entries: list[dict], running: set[str]) -> str:
+    if not entries:
+        return ""
+    lines = ["----------------------", "<b>Network summary</b>"]
+    total_revenue = 0.0
+    for entry in entries:
+        tag = str(entry.get("tag", ""))
+        with as_tag(tag):
+            requests = await list_requests()
+            approved = [r for r in requests if str(r.get("status")) == "approved"]
+            pending = sum(1 for r in requests if str(r.get("status")) == "pending")
+            revenue = sum(float(r.get("amount", 0) or 0) for r in approved)
+            users = await count_users_seen(tag)
+        total_revenue += revenue
+        status = "running" if tag in running else "stopped"
+        name = str(entry.get("username") or tag)
+        lines.append(
+            f"� @{name} [{status}] � Rs.{revenue:g}, {len(approved)} orders, "
+            f"{users} users, {pending} pending"
+        )
+    lines.append(f"Total network revenue: <b>Rs.{total_revenue:g}</b>")
+    return "\n".join(lines)
+
+
+async def _clone_stats_text(entry: dict) -> str:
+    tag = str(entry.get("tag", ""))
+    status = "?? running" if clone_manager.is_running(tag) else "?? stopped"
+    mode = "same clone (copied)" if entry.get("mode") == "copy" else "new database"
+    with as_tag(tag):
+        requests = await list_requests()
+        approved = [r for r in requests if str(r.get("status")) == "approved"]
+        pending = [r for r in requests if str(r.get("status")) == "pending"]
+        rejected = [
+            r for r in requests if str(r.get("status")) in {"rejected", "failed"}
+        ]
+        revenue = sum(float(r.get("amount", 0) or 0) for r in approved)
+        stuffs = await list_stuffs(include_archived=True)
+        users = await count_users_seen(tag)
+    now = datetime.now(timezone.utc)
+    today_revenue = 0.0
+    today_orders = 0
+    for request in approved:
+        moment = _event_time(request.get("created_at"))
+        if moment is not None and moment.date() == now.date():
+            today_revenue += float(request.get("amount", 0) or 0)
+            today_orders += 1
+    return (
+        f"?? <b>Clone: @{html.escape(str(entry.get('username') or tag))}</b>\n"
+        "----------------------\n"
+        f"Status: <b>{status}</b>\n"
+        f"Mode: {mode}\n"
+        f"Tag: <code>{html.escape(tag)}</code>\n"
+        "----------------------\n"
+        f"?? Users seen: <b>{users}</b>\n"
+        f"?? Stuffs: <b>{len(stuffs)}</b>\n"
+        f"?? Orders: {len(approved)} approved � {len(pending)} pending � "
+        f"{len(rejected)} rejected\n"
+        f"?? Revenue total: <b>Rs.{revenue:g}</b>\n"
+        f"?? Revenue today: <b>Rs.{today_revenue:g}</b> ({today_orders} orders)"
+    )
+
+
+def _clone_dash_kb(tag: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                ib("Broadcast to clone", f"clbc:{tag}", "success"),
+                ib("Stop" if clone_manager.is_running(tag) else "Start", f"cltog:{tag}"),
+            ],
+            [
+                ib("Remove", f"cldel:{tag}", "danger"),
+                ib("Back", "apnl:clones", "primary"),
+            ],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("clbc:"))
+async def cb_clone_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    if not await features.is_on("clonedash"):
+        await callback.answer("Clone dashboard is turned off", show_alert=True)
+        return
+    tag = callback.data.split(":", 1)[1]
+    entries = await clone_manager.load_registry()
+    entry = next((e for e in entries if e.get("tag") == tag), None)
+    if entry is None:
+        await callback.answer("Clone not found", show_alert=True)
+        return
+    name = str(entry.get("username") or tag)
+    await state.clear()
+    await state.set_state(AdminStates.broadcast_text)
+    await state.update_data(bc_tag=tag)
+    await callback.answer()
+    await _edit_or_send(
+        callback.message,
+        f"?? <b>Broadcast to @{html.escape(name)}</b>\n\n"
+        "Send the message: text, photo, video, GIF or sticker "
+        "(caption = text, sent as-is).\n"
+        "You will pick the audience and see a preview before sending.",
+        cancel_inline_kb(f"clinfo:{tag}"),
+    )
+
+
+@router.callback_query(F.data.startswith("cldelok:"))
+async def cb_clone_delete_ok(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    tag = callback.data.split(":", 1)[1]
+    await clone_manager.remove_clone(tag)
+    await features.audit(f"Clone removed: {tag}")
+    await callback.answer("Clone removed")
+    await _show_clones(callback.message)
+
+
+@router.message(AdminStates.cfg_alert, F.text)
+async def cfg_alert_save(message: Message, state: FSMContext) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or "").strip())
+    except ValueError:
+        await message.answer("Send a number, e.g. <code>500</code>")
+        return
+    if value < 0:
+        await message.answer("Value must be 0 or more")
+        return
+    await features.set_alert_min(value)
+    await features.audit(f"Big-sale alert threshold set to Rs.{value:g}")
+    await _features_done(
+        message,
+        state,
+        (
+            f"Big-sale alerts on from Rs.{value:g}"
+            if value > 0
+            else "Big-sale alerts disabled (threshold = 0)"
+        ),
+    )

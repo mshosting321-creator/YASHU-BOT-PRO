@@ -23,6 +23,7 @@ from database.store import (
     get_stuff,
     list_stuffs,
     set_setting,
+    touch_user,
 )
 from keyboards.inline import (
     after_payment_kb,
@@ -399,6 +400,12 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     except Exception:
         logger.exception("ensure_user failed on /start")
         user = None
+    try:
+        from database.scoping import current_tag
+
+        await touch_user(message.from_user.id, current_tag())
+    except Exception:
+        logger.exception("touch_user failed on /start")
 
     referrer = _parse_ref(message.text)
     if referrer and referrer != message.from_user.id:
@@ -418,7 +425,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             except ValueError:
                 moment = None
             if moment is not None:
-                for stuff in await list_stuffs():
+                for stuff in await list_stuffs(include_archived=False):
                     raw = stuff.get("created_at")
                     if not raw:
                         continue
@@ -468,20 +475,20 @@ async def cmd_help(message: Message) -> None:
 
 @router.callback_query(F.data == "scatalog")
 async def cb_catalog(callback: CallbackQuery) -> None:
-    items = await list_stuffs()
+    items = await list_stuffs(include_archived=False)
     admin = await is_admin(callback.from_user.id)
     if not items:
         await callback.answer("No stuffs yet", show_alert=True)
         return
     show_category = await features.is_on("categories")
-    if show_category:
-        items = sorted(
-            items,
-            key=lambda s: (
-                str(s.get("category") or "").lower(),
-                str(s.get("name") or "").lower(),
-            ),
-        )
+    items = sorted(
+        items,
+        key=lambda s: (
+            0 if s.get("featured") else 1,
+            str(s.get("category") or "").lower(),
+            str(s.get("name") or "").lower(),
+        ),
+    )
     await callback.answer()
     await _edit_or_send(
         callback.message,
@@ -492,20 +499,20 @@ async def cb_catalog(callback: CallbackQuery) -> None:
 
 @router.message(Command("catalog"))
 async def cmd_catalog(message: Message) -> None:
-    items = await list_stuffs()
+    items = await list_stuffs(include_archived=False)
     admin = await is_admin(message.from_user.id)
     if not items:
         await message.answer("No stuffs yet.")
         return
     show_category = await features.is_on("categories")
-    if show_category:
-        items = sorted(
-            items,
-            key=lambda s: (
-                str(s.get("category") or "").lower(),
-                str(s.get("name") or "").lower(),
-            ),
-        )
+    items = sorted(
+        items,
+        key=lambda s: (
+            0 if s.get("featured") else 1,
+            str(s.get("category") or "").lower(),
+            str(s.get("name") or "").lower(),
+        ),
+    )
     await message.answer(
         "<b>Stuffs</b>\n\nChoose a stuff:",
         reply_markup=catalog_kb(items, admin=admin, show_category=show_category),
@@ -666,7 +673,7 @@ async def cb_resume(callback: CallbackQuery) -> None:
 async def cb_view_demo(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     items = [
-        s for s in await list_stuffs()
+        s for s in await list_stuffs(include_archived=False)
         if any(lesson.get("is_demo") for lesson in s.get("lessons", []))
     ]
     if not items:
@@ -791,7 +798,7 @@ async def cb_proof_gallery(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "bdirect")
 async def cb_buy_directly(callback: CallbackQuery, state: FSMContext) -> None:
-    items = [s for s in await list_stuffs() if float(s.get("price", 0) or 0) > 0]
+    items = [s for s in await list_stuffs(include_archived=False) if float(s.get("price", 0) or 0) > 0]
     if not items:
         await callback.answer("Nothing to buy right now", show_alert=True)
         return
@@ -808,7 +815,7 @@ async def cb_buy_directly(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def _render_bdirect(callback: CallbackQuery, state: FSMContext) -> None:
-    items = [s for s in await list_stuffs() if float(s.get("price", 0) or 0) > 0]
+    items = [s for s in await list_stuffs(include_archived=False) if float(s.get("price", 0) or 0) > 0]
     data = await state.get_data()
     selected = set(data.get("selected") or [])
     await _edit_or_send(
@@ -836,7 +843,7 @@ async def cb_bselect_toggle(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(UserStates.bselect, F.data == "bda")
 async def cb_bselect_all(callback: CallbackQuery, state: FSMContext) -> None:
-    items = [s for s in await list_stuffs() if float(s.get("price", 0) or 0) > 0]
+    items = [s for s in await list_stuffs(include_archived=False) if float(s.get("price", 0) or 0) > 0]
     await state.update_data(selected=[str(s["_id"]) for s in items])
     await callback.answer("All selected")
     await _render_bdirect(callback, state)
@@ -1048,6 +1055,12 @@ async def cb_pay_from_balance(callback: CallbackQuery, state: FSMContext) -> Non
         coupon=coupon_code,
     )
     await set_request_status(request["_id"], "approved")
+    await features.sale_alert(
+        callback.bot,
+        price,
+        callback.from_user.full_name or str(callback.from_user.id),
+        ", ".join(str(s.get("name", "?")) for s in stuffs),
+    )
     await notify_log_group(
         callback.bot,
         text=build_transaction_text(request, "Delivered"),
@@ -1333,6 +1346,12 @@ async def _auto_approve_request(
         f"Auto-approved: Rs.{request.get('amount', '?')} from "
         f"{request.get('user_tg_id')}"
     )
+    await features.sale_alert(
+        message.bot,
+        float(request.get("amount") or 0),
+        str(request.get("user_username") or request.get("user_tg_id")),
+        str(request.get("stuff_name") or "stuff"),
+    )
     await notify_log_group(
         message.bot,
         text=build_transaction_text(request, "Auto-approved"),
@@ -1445,6 +1464,12 @@ async def on_successful_payment(message: Message, state: FSMContext) -> None:
         coupon=coupon_code,
     )
     await set_request_status(request["_id"], "approved")
+    await features.sale_alert(
+        message.bot,
+        float(request.get("amount") or stars),
+        message.from_user.full_name or str(message.from_user.id),
+        name,
+    )
 
     await notify_log_group(
         message.bot,
@@ -1829,6 +1854,15 @@ async def support_receive(message: Message, state: FSMContext) -> None:
         return
     await features.add_ticket(message.from_user, text)
     await features.audit(f"Support ticket from {message.from_user.id}")
+    try:
+        await features.alert_admins(
+            message.bot,
+            f"💬 New ticket from "
+            f"{html.escape(str(message.from_user.full_name or message.from_user.id))}\n\n"
+            f"{html.escape(text[:200])}",
+        )
+    except Exception:
+        logger.exception("ticket alert failed")
     await state.clear()
     await message.answer(
         "✅ Ticket created! The admin will reply here.",
@@ -1863,7 +1897,7 @@ async def search_receive(message: Message, state: FSMContext) -> None:
     if not query:
         await message.answer("Send a keyword to search:")
         return
-    matches = features.search_stuffs(await list_stuffs(), query)
+    matches = features.search_stuffs(await list_stuffs(include_archived=False), query)
     await state.clear()
     if not matches:
         await message.answer(

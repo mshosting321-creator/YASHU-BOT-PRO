@@ -20,10 +20,36 @@ starts with `mongodb+srv`.
 - **Admin panel via `/admin` only** — everything is managed from an inline panel in Telegram.
 - **Clone bots via `/clone TOKEN`** — spin up a clone from the main bot: same clone
   (copies all stuffs/categories) or new empty database.
-- **Broadcasts** — send an HTML message to every user with preview and confirmation.
+- **Broadcasts** — send text, photo, video, GIF or sticker (as-is, caption kept) to every
+  user with preview and confirmation; pick the audience: everyone, buyers, non-buyers,
+  a segment of a stuff, or send it *from a clone bot*.
 - **User manager** — look up a user by ID, ban/unban, add/remove balance.
 - **Stats / VPS panel** — users, revenue, payment requests, plus live CPU/RAM/disk/uptime.
 - **Log group** — payment screenshots and transaction notices go to a group/channel you choose.
+- **Dashboard** — one-screen KPIs (users, revenue, orders, pending claims) plus a live
+  activity feed of recent events.
+- **Pending claims inbox** — every payment claim in one place: screenshot, amount, item and
+  one-tap approve / reject, no log-group digging needed.
+- **Analytics** — funnel, today / 7-day / 30-day revenue, best sellers, coupon performance.
+- **Global search** — find stuffs, users, orders, clones and coupons from one search bar.
+- **Offer timers** — schedule a feature toggle or a price change (with optional price
+  restore) for a future date/time; flash-sale style promos run themselves.
+- **Media library** — reusable photo/video files: name them once, drop them into broadcasts
+  or start messages.
+- **Bulk ops** — select many stuffs and change price, category, archive or delete them at once.
+- **Stuffs controls** — archive/unarchive and pin/unpin straight from the stuffs list.
+- **Admin roles** — `full` / `support` / `content` roles: support handles users, tickets and
+  audit; content manages stuffs, media and start/help text; full admins do the rest.
+- **CRM** — per-user notes and tags on the user card, plus their last orders.
+- **Balance confirmations** — adding or removing wallet balance asks for an explicit
+  confirmation step (ON/OFF-able).
+- **Clone dashboard** — per-clone stats (users, orders, earnings), network totals across
+  all clones, and broadcast from any clone with one tap.
+- **Backup & restore** — download a fresh backup (SQLite file / JSON export) and restore a
+  previous one from the panel (SQLite restores apply on restart).
+- **Ticket SLA** — support tickets are sorted by age with a priority hint; canned replies
+  let you answer common questions in one tap.
+- **Big-sale alert** — admins get pinged whenever an order above a configured amount is paid.
 
 ### Togglable features (admin panel → Features)
 
@@ -69,6 +95,22 @@ can switch them on or off without touching the code:
 - **Access validity** — per-stuff day limit: buyers keep access only for N days after
   purchase (set it with the **Validity** button on the stuff page; countdown shows on the
   stuff page; 0 = forever).
+- **Dashboard** — the one-screen overview (default ON).
+- **Pending inbox** — the all-claims page (default ON).
+- **Analytics** — funnel / revenue / coupon stats (default ON).
+- **Global search** — the admin search bar (default ON).
+- **Offer timers** — scheduled feature/price changes (default ON).
+- **Audience segments** — buyer/non-buyer targeting for broadcasts (default ON).
+- **Ticket SLA** — age-based ticket sorting and priorities (default ON).
+- **Big-sale alert** — admin ping on large orders (default ON).
+- **Media library** — reusable broadcast media (default ON).
+- **Bulk ops** — multi-stuff edits (default ON).
+- **Stuffs controls** — archive/pin buttons (default ON).
+- **Backup & restore** — the Backup panel page (default ON).
+- **Admin roles** — role assignment (default ON).
+- **CRM** — user notes and tags (default ON).
+- **Balance confirm** — extra step on balance changes (default ON).
+- **Clone dashboard** — per-clone stats page (default ON).
 
 Amount settings (referral bonus, check-in bonus, force-join channel, backup/report times,
 cashback %, auto-approve max) are edited from buttons on the same Features page.
@@ -315,30 +357,51 @@ added inside the panel). Everyone else gets no response from `/admin`.
   showcase image, proofs, **category**, **validity (days)**, preview, delete,
   **Receive direct** (all media sent into the chat)
   and **Download ZIP** (one archive with `info.txt`, videos, demo files, cover and proofs).
+  Archive / unarchive and pin / unpin from the list; **Bulk mode** selects many stuffs
+  to change price/category, archive, restore or delete together.
 - **Start message** — set text / photo / video, preview, clear media.
 - **Help text** — edit the text users see when they press the **Help** button (HTML supported).
-- **Admins** — add by forwarded message or numeric id, remove (env admins cannot be removed).
+- **Admins** — add by forwarded message or numeric id, remove (env admins cannot be removed);
+  assign **full / support / content** roles when the Roles feature is ON.
 - **Payment methods** — crypto address or QR (UPI/INR) methods, Telegram Stars with
   *Star receiver @username*, activate/deactivate/delete.
 - **Protection** — send content with forwarding/cloud-save disabled.
 - **Log group** — forward a message from your group/channel (bot must be admin there).
-- **Users** — user manager: card with ban/unban and add/remove balance.
-- **Broadcast** — send HTML text to all users with preview and confirm.
+- **Users** — user manager: card with ban/unban, add/remove balance (confirmation when the
+  Balance confirm feature is ON), **notes and tags** (CRM), last orders, quick jumps.
+- **Broadcast** — pick an audience (everyone / buyers / non-buyers / a stuff's buyers /
+  clone-specific), send **text, photo, video, GIF or sticker** as-is with preview and confirm;
+  **Broadcast from clone** on the clone card sends it through that bot.
 - **Stats** — users, stuffs, methods, requests, revenue, wallet balances, uptime
   (plus a 7-day order graph when the graph feature is ON).
 - **VPS** — CPU, RAM, disk, process usage, bot/system uptime, active database backend.
-- **Clone bots** — list every clone with running/stopped status; start, stop or remove them.
-- **Features** — 28 ON/OFF toggles (coupons, referral, force-join, check-in, wishlist,
-  history, reviews, categories, welcome back, FAQ, auto backup, daily report, scheduler,
-  maintenance, resume, leaderboard, support, audit, graph, CSV, gift codes, search,
-  cashback, receipts, auto-approve, anti-flood, auto-reject, access validity) plus the
-  buttons for referral bonus, check-in bonus, force-join channel, backup time, report time,
-  cashback %, auto-approve max, Leaderboard, Audit log and CSV export.
+- **Clone bots** — list every clone with running/stopped status; start, stop or remove them
+  (removal asks for confirmation). **Clone dashboard**: per-clone users, orders, earnings,
+  network totals and broadcast-from-clone.
+- **Features** — 44 ON/OFF toggles (the 28 from earlier batches plus dashboard, pending
+  inbox, analytics, global search, offer timers, audience segments, ticket SLA, big-sale
+  alert, media library, bulk ops, stuffs controls, backup & restore, admin roles, CRM,
+  balance confirm, clone dashboard) plus the buttons for referral bonus, check-in bonus,
+  force-join channel, backup time, report time, cashback %, auto-approve max, big-sale
+  threshold, Leaderboard, Audit log and CSV export.
+- **Dashboard** — KPIs (users, revenue, orders, pending claims) + activity feed.
+- **Pending** — inbox of payment claims with screenshot, approve/reject per claim.
+- **Analytics** — funnel, today/7d/30d revenue, best sellers, coupon performance, order graph.
+- **Search** — one bar for stuffs, users, orders, clones, coupons.
 - **Coupons** — add a coupon (code, percent, max uses), toggle it on/off, delete it.
 - **Gift codes** — wallet voucher codes: add (amount + code or random), disable, delete.
 - **Reviews** — approve or delete user reviews.
-- **Support** — open tickets: view, reply to the user, close.
+- **Support** — open tickets: age/priority sorting, view, reply, one-tap **canned replies**
+  (add/delete), close.
 - **Schedule** — pending scheduled broadcasts: add or delete.
+- **Timers** — offer timers: schedule a feature toggle or a price change (+ optional restore
+  timer) for a date/time, delete pending ones.
+- **Media** — media library: add named photo/video media, preview or delete, reuse in
+  broadcasts and start messages.
+- **Bulk ops** — on the Stuffs page: select stuffs, then change price/category, archive,
+  restore or delete them together.
+- **Backup** — download a fresh backup or upload a previous backup file to restore
+  (SQLite: applies on the next restart).
 - **FAQ** — question/answer pairs for the auto-reply feature: add or delete.
 - **Audit log** — the recent admin activity trail.
 
@@ -391,3 +454,7 @@ proof_2.jpg
 
 With the default SQLite backend, back up the single file `course_bot.db` (copy it while the
 bot is stopped, or periodically). With MongoDB Atlas use Atlas snapshots or `mongodump`.
+
+From the admin panel (**Backup**) you can also download a fresh backup at any moment, or
+upload an earlier backup file to restore it: MongoDB restores apply immediately, SQLite
+restores apply on the next bot restart.

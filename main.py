@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -17,6 +18,25 @@ from utils.scheduler import start_scheduler, stop_scheduler
 logger = logging.getLogger(__name__)
 
 
+def _apply_restore() -> None:
+    """Replace the sqlite database with a staged restore file, if present."""
+    from config import DATABASE_URL
+
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    path = DATABASE_URL.replace("sqlite:///", "").replace("sqlite://", "")
+    staged = f"{path}.restore"
+    if not os.path.exists(staged):
+        return
+    try:
+        if os.path.exists(path):
+            os.replace(path, f"{path}.replaced")
+        os.replace(staged, path)
+        logger.info("staged database restore applied: %s", path)
+    except OSError:
+        logger.exception("database restore failed")
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -27,6 +47,8 @@ async def main() -> None:
         raise SystemExit("BOT_TOKEN is not set — fill in the .env file")
 
     MEDIA_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    _apply_restore()
 
     try:
         await connect_db()

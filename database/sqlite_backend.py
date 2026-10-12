@@ -34,12 +34,19 @@ async def connect(url: str) -> None:
         "full_name TEXT, "
         "purchased TEXT NOT NULL DEFAULT '[]', "
         "balance REAL NOT NULL DEFAULT 0, "
-        "banned INTEGER NOT NULL DEFAULT 0)"
+        "banned INTEGER NOT NULL DEFAULT 0, "
+        "expires TEXT NOT NULL DEFAULT '{}', "
+        "created_at TEXT, "
+        "last_seen_bot TEXT, "
+        "last_seen_at TEXT)"
     )
     for _migration in (
         "ALTER TABLE users ADD COLUMN balance REAL NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN expires TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE users ADD COLUMN created_at TEXT",
+        "ALTER TABLE users ADD COLUMN last_seen_bot TEXT",
+        "ALTER TABLE users ADD COLUMN last_seen_at TEXT",
     ):
         try:
             await _db.execute(_migration)
@@ -58,6 +65,8 @@ async def connect(url: str) -> None:
     for _migration in (
         "ALTER TABLE stuffs ADD COLUMN showcase TEXT",
         "ALTER TABLE stuffs ADD COLUMN proofs TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE stuffs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE stuffs ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             await _db.execute(_migration)
@@ -66,8 +75,15 @@ async def connect(url: str) -> None:
     await _db.execute(
         "CREATE TABLE IF NOT EXISTS admins ("
         "tg_id INTEGER PRIMARY KEY, "
-        "username TEXT)"
+        "username TEXT, "
+        "role TEXT NOT NULL DEFAULT 'full')"
     )
+    try:
+        await _db.execute(
+            "ALTER TABLE admins ADD COLUMN role TEXT NOT NULL DEFAULT 'full'"
+        )
+    except sqlite3.OperationalError:
+        pass
     await _db.execute(
         "CREATE TABLE IF NOT EXISTS methods ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -91,6 +107,8 @@ async def _ensure_stuffs_columns() -> None:
         "ALTER TABLE stuffs ADD COLUMN bot TEXT NOT NULL DEFAULT 'main'",
         "ALTER TABLE stuffs ADD COLUMN category TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE stuffs ADD COLUMN created_at TEXT",
+        "ALTER TABLE stuffs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE stuffs ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             await _db.execute(_migration)
@@ -117,14 +135,16 @@ async def _relax_stuffs_name_unique() -> None:
         "proofs TEXT NOT NULL DEFAULT '[]', "
         "bot TEXT NOT NULL DEFAULT 'main', "
         "category TEXT NOT NULL DEFAULT '', "
-        "created_at TEXT)"
+        "created_at TEXT, "
+        "archived INTEGER NOT NULL DEFAULT 0, "
+        "featured INTEGER NOT NULL DEFAULT 0)"
     )
     await _db.execute(
         "INSERT INTO stuffs_tmp "
         "(id, name, description, price, lessons, showcase, proofs, bot, "
-        "category, created_at) "
+        "category, created_at, archived, featured) "
         "SELECT id, name, description, price, lessons, showcase, proofs, bot, "
-        "category, created_at "
+        "category, created_at, archived, featured "
         "FROM stuffs"
     )
     await _db.execute("DROP TABLE stuffs")
@@ -299,6 +319,8 @@ def _stuff_row(row) -> dict:
         "bot": row["bot"] if "bot" in keys else "main",
         "category": row["category"] if "category" in keys else "",
         "created_at": row["created_at"] if "created_at" in keys else None,
+        "archived": bool(row["archived"]) if "archived" in keys else False,
+        "featured": bool(row["featured"]) if "featured" in keys else False,
     }
 
 
@@ -430,6 +452,20 @@ async def set_stuff_category(stuff_id, category: str) -> None:
     await _conn().commit()
 
 
+async def set_stuff_flags_row(stuff_id, archived=None, featured=None) -> None:
+    if archived is not None:
+        await _conn().execute(
+            "UPDATE stuffs SET archived = ? WHERE id = ?",
+            (1 if archived else 0, int(stuff_id)),
+        )
+    if featured is not None:
+        await _conn().execute(
+            "UPDATE stuffs SET featured = ? WHERE id = ?",
+            (1 if featured else 0, int(stuff_id)),
+        )
+    await _conn().commit()
+
+
 async def delete_stuff(stuff_id) -> None:
     await _conn().execute("DELETE FROM stuffs WHERE id = ?", (int(stuff_id),))
     await _conn().commit()
@@ -476,6 +512,7 @@ def _loads_list(value) -> list:
 
 
 def _user_row(row) -> dict:
+    keys = row.keys()
     return {
         "_id": row["tg_id"],
         "tg_id": row["tg_id"],
@@ -485,6 +522,9 @@ def _user_row(row) -> dict:
         "balance": float(row["balance"]),
         "banned": bool(row["banned"]),
         "expires": _loads_dict(row["expires"]),
+        "created_at": row["created_at"] if "created_at" in keys else None,
+        "last_seen_bot": row["last_seen_bot"] if "last_seen_bot" in keys else None,
+        "last_seen_at": row["last_seen_at"] if "last_seen_at" in keys else None,
     }
 
 
@@ -498,10 +538,11 @@ def _loads_dict(value) -> dict:
 
 async def ensure_user_row(tg_id: int, username: str | None, full_name: str | None) -> dict:
     await _conn().execute(
-        "INSERT INTO users (tg_id, username, full_name) VALUES (?, ?, ?) "
+        "INSERT INTO users (tg_id, username, full_name, created_at) "
+        "VALUES (?, ?, ?, ?) "
         "ON CONFLICT(tg_id) DO UPDATE SET username = excluded.username, "
         "full_name = excluded.full_name",
-        (tg_id, username, full_name),
+        (tg_id, username, full_name, datetime.now(timezone.utc).isoformat()),
     )
     await _conn().commit()
     cursor = await _conn().execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
@@ -509,10 +550,64 @@ async def ensure_user_row(tg_id: int, username: str | None, full_name: str | Non
     return _user_row(row)
 
 
+async def touch_user_row(tg_id: int, bot_tag: str | None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    await _conn().execute(
+        "UPDATE users SET last_seen_at = ?, last_seen_bot = ? WHERE tg_id = ?",
+        (now, bot_tag, tg_id),
+    )
+    await _conn().commit()
+
+
+async def count_users_seen_row(bot_tag: str | None) -> int:
+    cursor = await _conn().execute(
+        "SELECT COUNT(*) AS c FROM users WHERE last_seen_bot = ?", (bot_tag,)
+    )
+    row = await cursor.fetchone()
+    return int(row["c"]) if row else 0
+
+
+async def count_users_created_after_row(iso: str) -> int:
+    cursor = await _conn().execute(
+        "SELECT COUNT(*) AS c FROM users WHERE created_at IS NOT NULL "
+        "AND created_at >= ?",
+        (iso,),
+    )
+    row = await cursor.fetchone()
+    return int(row["c"]) if row else 0
+
+
+async def list_user_ids_seen_row(bot_tag: str | None) -> list[int]:
+    cursor = await _conn().execute(
+        "SELECT tg_id FROM users WHERE last_seen_bot = ?", (bot_tag,)
+    )
+    rows = await cursor.fetchall()
+    return [int(row["tg_id"]) for row in rows]
+
+
 async def find_user_row(tg_id: int) -> dict | None:
     cursor = await _conn().execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
     row = await cursor.fetchone()
     return _user_row(row) if row else None
+
+
+async def search_users_row(query: str, limit: int = 5) -> list[dict]:
+    pattern = f"%{query}%"
+    prefix = f"{query}%"
+    if query.isdigit():
+        cursor = await _conn().execute(
+            "SELECT * FROM users WHERE tg_id = ? OR CAST(tg_id AS TEXT) LIKE ? "
+            "OR username LIKE ? OR full_name LIKE ? ORDER BY tg_id LIMIT ?",
+            (int(query), prefix, pattern, pattern, limit),
+        )
+    else:
+        cursor = await _conn().execute(
+            "SELECT * FROM users WHERE username LIKE ? OR full_name LIKE ? "
+            "ORDER BY tg_id LIMIT ?",
+            (pattern, pattern, limit),
+        )
+    rows = await cursor.fetchall()
+    return [_user_row(row) for row in rows]
 
 
 async def add_purchased(tg_id: int, stuff_id: str) -> None:
@@ -637,7 +732,12 @@ async def list_admin_rows() -> list[dict]:
     cursor = await _conn().execute("SELECT * FROM admins ORDER BY tg_id")
     rows = await cursor.fetchall()
     return [
-        {"_id": row["tg_id"], "tg_id": row["tg_id"], "username": row["username"]}
+        {
+            "_id": row["tg_id"],
+            "tg_id": row["tg_id"],
+            "username": row["username"],
+            "role": row["role"] if "role" in row.keys() else "full",
+        }
         for row in rows
     ]
 
@@ -654,6 +754,13 @@ async def upsert_admin_row(tg_id: int, username: str | None) -> None:
         "INSERT INTO admins (tg_id, username) VALUES (?, ?) "
         "ON CONFLICT(tg_id) DO UPDATE SET username = excluded.username",
         (tg_id, username),
+    )
+    await _conn().commit()
+
+
+async def set_admin_role_row(tg_id: int, role: str) -> None:
+    await _conn().execute(
+        "UPDATE admins SET role = ? WHERE tg_id = ?", (role, tg_id)
     )
     await _conn().commit()
 
